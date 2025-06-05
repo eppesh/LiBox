@@ -404,46 +404,17 @@ public:
         }
         
         size_t collected = 0;
-        
-        if (!need_filter) {
-            size_t total_count = getTotalCount();
-            
-            if (total_count <= max_count) {
-                for (size_t i = 0; i < capacity && collected < max_count; i++) {
-                    size_t box_collected = data[i]->scan_load(
-                        result + collected, 
-                        max_count - collected
-                    );
-                    collected += box_collected;
-                }
-                return collected;
-            } else {
-                ensure_temp_buffer(total_count);
-                size_t total_collected = 0;
-                
-                for (size_t i = 0; i < capacity; i++) {
-                    size_t box_collected = data[i]->copyAllData(
-                        temp_buffer.get() + total_collected
-                    );
-                    total_collected += box_collected;
-                }
-                
-                memcpy(result, temp_buffer.get(), 
-                    max_count * sizeof(pair<KeyType, ValueType>));
-                return max_count;
-            }
-        } else {
-            for (size_t i = 0; i < capacity && collected < max_count; i++) {
-                size_t box_collected = data[i]->scan_optimized(
-                    key_low_bound, 
-                    max_count - collected, 
-                    result + collected,
-                    true  // need_filter = true
-                );
-                collected += box_collected;
-            }
-            return collected;
+        for (size_t i = 0; i < capacity && collected < max_count; i++) {
+            size_t box_collected = data[i]->scan_optimized(
+                key_low_bound, 
+                max_count - collected, 
+                result + collected,
+                true  // need_filter = true
+            );
+            collected += box_collected;
         }
+        return collected;
+        
     }
 
     size_t scan(KeyType key_low_bound, size_t max_count, 
@@ -609,11 +580,10 @@ private:
     }
 
     size_t copyMainKeysWithLimit(pair<KeyType, ValueType>* result, size_t max_count) const {
-        size_t to_copy = min(currentSize, max_count);
-        for (size_t i = 0; i < to_copy; i++) {
+        for (size_t i = 0; i < currentSize; i++) {
             result[i] = {keys[i], values[i]};
         }
-        return to_copy;
+        return currentSize;
     }
 
 public: 
@@ -803,7 +773,7 @@ public:
     size_t scan_load(pair<KeyType, ValueType>* result, size_t max_count) const {
         size_t collected = copyMainKeysWithLimit(result, max_count);
         
-        if (sharedOverflow && collected < max_count) {
+        if (sharedOverflow) {
             collected += sharedOverflow->scan_load(
                 result + collected, 
                 max_count - collected
@@ -1147,9 +1117,9 @@ public:
             
             if (seg_collected == 0 && need_filter) {
                 if (key_low_bound > segments[seg_idx].getUpperBound()) {
-                    continue; 
+                    continue;
                 } else {
-                    break; 
+                    break;
                 }
             }
         }
