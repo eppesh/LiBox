@@ -1,0 +1,13 @@
+timestamp,read_ratio,insert_ratio,key_path,throughput,init_num_keys,thread_num,batch_size,total_num_keys
+20250605001208,0.5,0.5,sample/sample_keys.txt,0,1000,4,1000,2000
+20250605001224,0.5,0.5,sample/sample_keys.txt,85.5139,1000,1,1000,2000
+20250605001236,0.5,0.5,sample/sample_keys.txt,68.1896,1000,4,1000,2000
+20250605001245,0.5,0.5,sample/sample_keys.txt,85.5066,1000,1,1000,2000
+20250605001254,0.5,0.5,sample/sample_keys.txt,67.9186,1000,2,1000,2000
+20250605001543,0.5,0.5,sample/sample_keys.txt,64.4953,1000,2,1000,2000
+20250605001606,0.5,0.5,sample/sample_keys.txt,84.9979,1000,1,1000,2000
+20250605001611,0.5,0.5,sample/sample_keys.txt,82.8535,1000,1,1000,2000
+20250605001624,0.5,0.5,sample/sample_keys.txt,66.6445,1000,2,1000,2000
+20250605002233,0.5,0.5,/home/jianz/workplace/Density/w019.csv,109.078,350000,2,100000,750000
+20250605002246,0.5,0.5,/home/jianz/workplace/Density/w019.csv,108.5,350000,2,100000,750000
+20250605002254,0.5,0.5,/home/jianz/workplace/Density/w019.csv,110.251,350000,2,200000,750000
