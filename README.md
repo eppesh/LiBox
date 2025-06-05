@@ -121,8 +121,6 @@ index.loadConfigByFile("config.csv");
 // Core operations
 index.insertKeyValue(key, value);           // Insert operation
 auto result = index.searchKey(key);         // Point search
-auto range_result = index.rangeSearch(start, end);  // Range query
-size_t count = index.scan(key_bound, max_count, results);  // Scan operation
 ```
 
 ### libox_utils.h - Utility Functions
