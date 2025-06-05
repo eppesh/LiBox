@@ -221,19 +221,19 @@ The `sample/` directory contains example files for quick testing:
 
 1. **Analyze and Generate Configuration**:
    ```bash
-   ./test/partition_optimization --input_file=your_data.csv --output_config=optimized.csv
+   ./test/partition_optimization --input_file=your_data.csv --output_config=optimized_segment.csv
    ```
 
 2. **Run Benchmark**:
    ```bash
-   ./test/benchmark --keys_file=your_data.csv --config_file_path=optimized.csv --init_num_keys=1000000 --total_num_keys=2000000
+   ./test/benchmark --keys_file=your_data.csv --config_file_path=optimized_segment.csv --keys_file_type=text --init_num_keys=1000000 --total_num_keys=2000000
    ```
 
 ### For Quick Testing
 
 1. **Use Sample Data**:
    ```bash
-   ./test/benchmark --keys_file=sample/sample_keys.txt --config_file_path=sample/sample_config.csv --init_num_keys=1000 --total_num_keys=2000
+   ./test/benchmark --keys_file=sample/sample_keys.txt --config_file_path=sample/sample_config.csv --keys_file_type=text --init_num_keys=1000 --total_num_keys=2000
    ```
 
 ## Performance Optimizations
