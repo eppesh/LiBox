@@ -121,8 +121,6 @@ private:
     size_t avx512_filter_keys_optimized(KeyType key_low_bound, 
                                      pair<KeyType, ValueType>* result_buffer,
                                      size_t max_results) const {
-        _mm_prefetch((const char*)&keys[0], _MM_HINT_T0);
-        _mm_prefetch((const char*)&values[0], _MM_HINT_T0);
         size_t collected = 0;    
         uint8_t target_low = static_cast<uint8_t>(key_low_bound & 0xFF);
         __m512i v_threshold = _mm512_set1_epi8(target_low);
@@ -174,8 +172,9 @@ public:
     }
 
     int findKeyIndex(KeyType key) const {
-        uint8_t target_low = static_cast<uint8_t>(key & 0xFF);
-        
+        uint8_t key_low = key & 0xFF;
+        uint8_t target_low = ((key_low * 251) % 255) + 1;     
+
         __m512i v_target_low = _mm512_set1_epi8(target_low);
         __m512i v_keys_low = _mm512_load_si512(reinterpret_cast<const __m512i*>(keys_low.data()));
         __mmask64 mask_low = _mm512_cmpeq_epi8_mask(v_keys_low, v_target_low);
@@ -229,7 +228,8 @@ public:
                 return {InsertStatus::SPLIT, 1};
             }
             keys[currentSize] = key;
-            keys_low[currentSize] = static_cast<uint8_t>(key & 0xFF);         // lower 8 bits
+            uint8_t key_low = key & 0xFF;
+            keys_low[currentSize] = ((key_low * 251) % 255) + 1;
             values[currentSize] = value;
             currentSize++;
             overVersion.store(0, memory_order_release);
@@ -546,7 +546,8 @@ private:
     }
 
     int findKeyIndex(KeyType key) const {
-        uint8_t target_low = static_cast<uint8_t>(key & 0xFF);
+        uint8_t key_low = key & 0xFF;
+        uint8_t target_low = ((key_low * 251) % 255) + 1;
 
         __m512i v_target_low = _mm512_set1_epi8(target_low);
         __m512i v_keys_low = _mm512_load_si512(reinterpret_cast<const __m512i*>(keys_low.data()));
@@ -677,7 +678,8 @@ public:
                     return {InsertStatus::SPLIT, 1};
                 }
                 keys[currentSize] = key;
-                keys_low[currentSize] = static_cast<uint8_t>(key & 0xFF);
+                uint8_t key_low = key & 0xFF;
+                keys_low[currentSize] = ((key_low * 251) % 255) + 1;
                 values[currentSize] = value;
                 currentSize++;
                 boxVersion.store(0, memory_order_release);
