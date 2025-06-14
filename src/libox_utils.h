@@ -7,6 +7,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <limits>
+#include <cstdint>
 
 using namespace std;
 
@@ -85,10 +86,9 @@ StructSegment<KeyType> createSegment(const vector<Block<KeyType>>& blocks, KeyTy
 }
 
 template <typename KeyType>
-int countKeysInInterval(const vector<KeyType>& data, KeyType L, KeyType U) {
-    auto lowerIt = lower_bound(data.begin(), data.end(), L);
-    auto upperIt = upper_bound(data.begin(), data.end(), U);
-    return upperIt - lowerIt;
+int countKeysInInterval(const vector<KeyType>& data, auto startIt, KeyType U) {
+    auto endIt = upper_bound(startIt, data.end(), U);
+    return endIt - startIt;
 }
 
 template <typename KeyType>
@@ -99,10 +99,20 @@ double computeUnderflowRatioAccurate(const vector<KeyType>& data, const StructSe
     int box_num = (int)ceil((double)seg_len / (double)seg.box_range);
     double cumUnderflow = 0.0;
     double cumKeys = 0.0;
+    auto startIt = lower_bound(data.begin(), data.end(), seg_lower);
+
     for (int i = 0; i < box_num; i++) {
-        KeyType boxLower = seg_lower + i * seg.box_range;
         KeyType boxUpper = min(seg_lower + (i + 1) * seg.box_range - 1, seg_upper);
-        int countBox = countKeysInInterval(data, boxLower, boxUpper);
+        
+        int countBox = countKeysInInterval(data, startIt, boxUpper);
+#ifndef NDEBUG
+        KeyType boxLower = seg_lower + i * seg.box_range;
+        int check = countKeysInInterval(data, boxLower, boxUpper);
+        if (countBox != check) {
+            cout << "countBox: " << countBox << ", check: " << check << endl;
+        }
+#endif
+        startIt += countBox;
         cumKeys += countBox;
         if (countBox < BOX_CAPACITY)
             cumUnderflow += (BOX_CAPACITY - countBox);
@@ -118,13 +128,26 @@ double computeOverflowRatioAccurate(const vector<KeyType>& data, const StructSeg
     int box_num = (int)ceil((double)seg_len / (double)seg.box_range);
     double cumOverflow = 0.0;
     double cumKeys = 0.0;
+    auto startIt = lower_bound(data.begin(), data.end(), seg_lower);
+
     for (int i = 0; i < box_num; i++) {
         KeyType boxLower = seg_lower + i * seg.box_range;
         KeyType boxUpper = min(seg_lower + (i + 1) * seg.box_range - 1, seg_upper);
-        int countBox = countKeysInInterval(data, boxLower, boxUpper);
+        
+        int countBox = countKeysInInterval(data, startIt, boxUpper);
+#ifndef NDEBUG
+        KeyType boxLower = seg_lower + i * seg.box_range;
+        int check = countKeysInInterval(data, boxLower, boxUpper);
+        if (countBox != check) {
+            cout << "countBox: " << countBox << ", check: " << check << endl;
+        }
+#endif
+
         if (countBox >= 128){
             return std::numeric_limits<int>::max();
         }
+
+        startIt += countBox;
         cumKeys += countBox;
         if (countBox > BOX_CAPACITY)
             cumOverflow += (countBox - BOX_CAPACITY);
