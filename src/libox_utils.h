@@ -1,13 +1,13 @@
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <vector>
-#include <string>
 #include <algorithm>
 #include <cmath>
-#include <stdexcept>
-#include <limits>
 #include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 using namespace std;
 
@@ -24,15 +24,18 @@ struct Block {
 
 template <typename KeyType>
 struct StructSegment {
-    KeyType startIndex;   
-    KeyType endIndex;    
-    KeyType seg_lower;   
-    KeyType seg_upper;  
-    KeyType box_range;   
+    KeyType startIndex;
+    KeyType endIndex;
+    KeyType seg_lower;
+    KeyType seg_upper;
+    KeyType box_range;
 };
 
 template <typename KeyType>
-vector<Block<KeyType>> computeBlocks(const vector<KeyType>& data, int blockSize = BLOCK_SIZE, KeyType newseg_lower = 0, KeyType newseg_upper = 0) {
+vector<Block<KeyType>> computeBlocks(const vector<KeyType>& data,
+                                     int blockSize = BLOCK_SIZE,
+                                     KeyType newseg_lower = 0,
+                                     KeyType newseg_upper = 0) {
     vector<Block<KeyType>> blocks;
     size_t n = data.size();
     size_t start;
@@ -40,24 +43,26 @@ vector<Block<KeyType>> computeBlocks(const vector<KeyType>& data, int blockSize 
     for (size_t i = 0; i < n; i += blockSize) {
         if (i == 0) {
             start = 0;
-        }else {
+        } else {
             start = end;
         }
         end = min(n - 1, i + blockSize - 1);
         Block<KeyType> b;
-        if (i == 0){
-            b.startKey = (newseg_lower == 0 && data[start] == 0) ? 0 : (newseg_lower == 0 ? data[start] - 1 : newseg_lower);
-        }else {
+        if (i == 0) {
+            b.startKey = (newseg_lower == 0 && data[start] == 0)
+                             ? 0
+                             : (newseg_lower == 0 ? data[start] - 1 : newseg_lower);
+        } else {
             b.startKey = data[start];
         }
-        if (end == (n-1)){
+        if (end == (n - 1)) {
             // b.endKey = newseg_upper == 0 ? data[end] + 1 : newseg_upper;
             if (newseg_upper == 0) {
                 b.endKey = (data[end] == UINT64_MAX) ? UINT64_MAX : data[end] + 1;
             } else {
                 b.endKey = newseg_upper;
             }
-        }else{
+        } else {
             b.endKey = data[end];
         }
         b.range = b.endKey - b.startKey;
@@ -67,15 +72,16 @@ vector<Block<KeyType>> computeBlocks(const vector<KeyType>& data, int blockSize 
 }
 
 template <typename KeyType>
-StructSegment<KeyType> createSegment(const vector<Block<KeyType>>& blocks, KeyType i, KeyType j, KeyType box_range=0) {
+StructSegment<KeyType>
+createSegment(const vector<Block<KeyType>>& blocks, KeyType i, KeyType j, KeyType box_range = 0) {
     StructSegment<KeyType> seg;
     seg.startIndex = i;
     seg.endIndex = j;
     seg.seg_lower = blocks[i].startKey;
     seg.seg_upper = blocks[j].endKey;
-    if (box_range){
+    if (box_range) {
         seg.box_range = box_range;
-    }else{
+    } else {
         KeyType minRange = numeric_limits<KeyType>::max();
         for (int idx = i; idx <= j; idx++) {
             minRange = min(minRange, blocks[idx].range);
@@ -92,7 +98,8 @@ int countKeysInInterval(const vector<KeyType>& data, auto startIt, KeyType U) {
 }
 
 template <typename KeyType>
-double computeUnderflowRatioAccurate(const vector<KeyType>& data, const StructSegment<KeyType>& seg) {
+double computeUnderflowRatioAccurate(const vector<KeyType>& data,
+                                     const StructSegment<KeyType>& seg) {
     KeyType seg_lower = seg.seg_lower;
     KeyType seg_upper = seg.seg_upper;
     KeyType seg_len = seg_upper - seg_lower;
@@ -103,7 +110,7 @@ double computeUnderflowRatioAccurate(const vector<KeyType>& data, const StructSe
 
     for (int i = 0; i < box_num; i++) {
         KeyType boxUpper = min(seg_lower + (i + 1) * seg.box_range - 1, seg_upper);
-        
+
         int countBox = countKeysInInterval(data, startIt, boxUpper);
 #ifndef NDEBUG
         KeyType boxLower = seg_lower + i * seg.box_range;
@@ -114,14 +121,14 @@ double computeUnderflowRatioAccurate(const vector<KeyType>& data, const StructSe
 #endif
         startIt += countBox;
         cumKeys += countBox;
-        if (countBox < BOX_CAPACITY)
-            cumUnderflow += (BOX_CAPACITY - countBox);
+        if (countBox < BOX_CAPACITY) cumUnderflow += (BOX_CAPACITY - countBox);
     }
     return (cumKeys > 0) ? (cumUnderflow / cumKeys) : 0.0;
 }
 
 template <typename KeyType>
-double computeOverflowRatioAccurate(const vector<KeyType>& data, const StructSegment<KeyType>& seg) {
+double computeOverflowRatioAccurate(const vector<KeyType>& data,
+                                    const StructSegment<KeyType>& seg) {
     KeyType seg_lower = seg.seg_lower;
     KeyType seg_upper = seg.seg_upper;
     KeyType seg_len = seg_upper - seg_lower;
@@ -133,7 +140,7 @@ double computeOverflowRatioAccurate(const vector<KeyType>& data, const StructSeg
     for (int i = 0; i < box_num; i++) {
         KeyType boxLower = seg_lower + i * seg.box_range;
         KeyType boxUpper = min(seg_lower + (i + 1) * seg.box_range - 1, seg_upper);
-        
+
         int countBox = countKeysInInterval(data, startIt, boxUpper);
 #ifndef NDEBUG
         KeyType boxLower = seg_lower + i * seg.box_range;
@@ -143,27 +150,33 @@ double computeOverflowRatioAccurate(const vector<KeyType>& data, const StructSeg
         }
 #endif
 
-        if (countBox >= 128){
+        if (countBox >= 128) {
             return std::numeric_limits<int>::max();
         }
 
         startIt += countBox;
         cumKeys += countBox;
-        if (countBox > BOX_CAPACITY)
-            cumOverflow += (countBox - BOX_CAPACITY);
+        if (countBox > BOX_CAPACITY) cumOverflow += (countBox - BOX_CAPACITY);
     }
     return (cumKeys > 0) ? (cumOverflow / cumKeys) : 0.0;
 }
 
 template <typename KeyType>
-StructSegment<KeyType> mergeCandidate(const vector<StructSegment<KeyType>>& initSegments, const vector<Block<KeyType>>& blocks, KeyType startIdx, KeyType endIdx, KeyType box_range) {
+StructSegment<KeyType> mergeCandidate(const vector<StructSegment<KeyType>>& initSegments,
+                                      const vector<Block<KeyType>>& blocks,
+                                      KeyType startIdx,
+                                      KeyType endIdx,
+                                      KeyType box_range) {
     KeyType globalStart = initSegments[startIdx].startIndex;
     KeyType globalEnd = initSegments[endIdx].endIndex;
     return createSegment(blocks, globalStart, globalEnd, box_range);
 }
 
 template <typename KeyType>
-vector<StructSegment<KeyType>> partitionSegmentsOverall(const vector<Block<KeyType>>& blocks, const vector<KeyType>& data, double underflowThreshold, int maxMergeCount) {
+vector<StructSegment<KeyType>> partitionSegmentsOverall(const vector<Block<KeyType>>& blocks,
+                                                        const vector<KeyType>& data,
+                                                        double underflowThreshold,
+                                                        int maxMergeCount) {
     vector<StructSegment<KeyType>> segments;
     int m = blocks.size();
     if (m == 0) return segments;
@@ -176,7 +189,7 @@ vector<StructSegment<KeyType>> partitionSegmentsOverall(const vector<Block<KeyTy
             double uf = computeUnderflowRatioAccurate(data, candidate);
             if (uf <= underflowThreshold) {
                 mergeCount = 0;
-            }else{
+            } else {
                 mergeCount++;
             }
             j++;
@@ -188,9 +201,12 @@ vector<StructSegment<KeyType>> partitionSegmentsOverall(const vector<Block<KeyTy
 }
 
 template <typename KeyType>
-vector<StructSegment<KeyType>> expandSegments(const vector<StructSegment<KeyType>>& initSegments, const vector<Block<KeyType>>& blocks,
-                               const vector<KeyType>& data,
-                               double underflowThreshold, double overflowThreshold, int maxMergeCount) {
+vector<StructSegment<KeyType>> expandSegments(const vector<StructSegment<KeyType>>& initSegments,
+                                              const vector<Block<KeyType>>& blocks,
+                                              const vector<KeyType>& data,
+                                              double underflowThreshold,
+                                              double overflowThreshold,
+                                              int maxMergeCount) {
     vector<StructSegment<KeyType>> merged;
     int n = initSegments.size();
     KeyType i = 0;
@@ -199,7 +215,8 @@ vector<StructSegment<KeyType>> expandSegments(const vector<StructSegment<KeyType
         KeyType next = i + 1;
         int mergeCount = 0;
         while (next < n && mergeCount < maxMergeCount) {
-            StructSegment<KeyType> candidate = mergeCandidate(initSegments, blocks, i, next, current.box_range);
+            StructSegment<KeyType> candidate =
+                mergeCandidate(initSegments, blocks, i, next, current.box_range);
             double uf = computeUnderflowRatioAccurate(data, candidate);
             double of = computeOverflowRatioAccurate(data, candidate);
             if (uf <= underflowThreshold && of <= overflowThreshold) {
@@ -215,4 +232,4 @@ vector<StructSegment<KeyType>> expandSegments(const vector<StructSegment<KeyType
     }
     return merged;
 }
-}
+} // namespace liboxns
