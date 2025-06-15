@@ -6,7 +6,7 @@
 
 using namespace liboxns;
 
-using KeyType = uint64_t; // vmware&cambridge uint32_t; longitudes-200M int64_T
+using KeyType = int64_t; // vmware&cambridge uint32_t; longitudes-200M int64_T
 
 bool load_data(const std::string& input, std::vector<KeyType>& data) {
     std::ifstream fin(input);

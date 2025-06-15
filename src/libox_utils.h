@@ -92,7 +92,9 @@ createSegment(const vector<Block<KeyType>>& blocks, KeyType i, KeyType j, KeyTyp
 }
 
 template <typename KeyType>
-int countKeysInInterval(const vector<KeyType>& data, auto startIt, KeyType U) {
+int countKeysInInterval(const vector<KeyType>& data,
+                        typename vector<KeyType>::const_iterator startIt,
+                        KeyType U) {
     auto endIt = upper_bound(startIt, data.end(), U);
     return endIt - startIt;
 }
@@ -112,13 +114,6 @@ double computeUnderflowRatioAccurate(const vector<KeyType>& data,
         KeyType boxUpper = min(seg_lower + (i + 1) * seg.box_range - 1, seg_upper);
 
         int countBox = countKeysInInterval(data, startIt, boxUpper);
-#ifndef NDEBUG
-        KeyType boxLower = seg_lower + i * seg.box_range;
-        int check = countKeysInInterval(data, boxLower, boxUpper);
-        if (countBox != check) {
-            cout << "countBox: " << countBox << ", check: " << check << endl;
-        }
-#endif
         startIt += countBox;
         cumKeys += countBox;
         if (countBox < BOX_CAPACITY) cumUnderflow += (BOX_CAPACITY - countBox);
@@ -138,17 +133,9 @@ double computeOverflowRatioAccurate(const vector<KeyType>& data,
     auto startIt = lower_bound(data.begin(), data.end(), seg_lower);
 
     for (int i = 0; i < box_num; i++) {
-        KeyType boxLower = seg_lower + i * seg.box_range;
         KeyType boxUpper = min(seg_lower + (i + 1) * seg.box_range - 1, seg_upper);
 
         int countBox = countKeysInInterval(data, startIt, boxUpper);
-#ifndef NDEBUG
-        KeyType boxLower = seg_lower + i * seg.box_range;
-        int check = countKeysInInterval(data, boxLower, boxUpper);
-        if (countBox != check) {
-            cout << "countBox: " << countBox << ", check: " << check << endl;
-        }
-#endif
 
         if (countBox >= 128) {
             return std::numeric_limits<int>::max();
