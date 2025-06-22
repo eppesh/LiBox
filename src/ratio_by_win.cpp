@@ -80,15 +80,9 @@ vector<Block<KeyType>> computeBlocksByWind(const vector<KeyType>& data, KeyType 
 
         // window size reaches past end of data
         if (start_key > KEY_MAX - window_size || start_key + window_size > last) {
-            cout << "start_key: " << start_key << " last: " << last << endl; // DEBUG
-            cout << "start_key > KEY_MAX - window_size: " << (start_key > KEY_MAX - window_size)
-                 << endl; // DEBUG
-            cout << "start_key + window_size > last: " << (start_key + window_size > last)
-                 << endl; // DEBUG
             block.endKey = (last == KEY_MAX) ? KEY_MAX : last + 1;
             block.range = block.endKey - block.startKey;
             blocks.push_back(block);
-            cout << "reached past end!! blocks.size(): " << blocks.size() << endl; // DEBUG
             break;
         }
 
@@ -100,7 +94,6 @@ vector<Block<KeyType>> computeBlocksByWind(const vector<KeyType>& data, KeyType 
         start_key = end_key;
         size_t end_ind = upper_bound(data.begin() + start_ind, data.end(), end_key - 1) -
                          data.begin();
-        cout << "start_ind: " << start_ind << " end_ind: " << end_ind << endl; // DEBUG
         start_ind = end_ind;
     }
 
@@ -130,23 +123,13 @@ void calc_graph(vector<KeyType>& data,
 
     for (KeyType window_size : window_sizes) {
         vector<Block<KeyType>> blocks = computeBlocksByWind(data, window_size);
-        printBlocks(blocks); // DEBUG
 
         for (KeyType i = 0; i < blocks.size(); i++) {
-            if (i == 7) {
-                // DEBUG
-                cout << "hi";
-            }
-
             StructSegment<KeyType> seg =
                 createSegment(blocks, static_cast<KeyType>(0), i, window_size);
 
             double underflow_ratio = computeUnderflowRatioAccurate(data, seg);
             double overflow_ratio = computeOverflowRatioNoUpperBound(data, seg);
-
-            if ((overflow_ratio > 1e6) || (underflow_ratio > 1)) { // DEBUG
-                cout << "too large overflow or underflow ratio";
-            }
 
             outfile << window_size << "," << i + 1 << "," << underflow_ratio << ","
                     << overflow_ratio << "\n";
