@@ -46,7 +46,7 @@ vector<Block<KeyType>> computeBlocks(const vector<KeyType>& data,
         } else {
             start = end;
         }
-        end = min(n - 1, i + blockSize - 1);
+        end = min(n, i + blockSize);
         Block<KeyType> b;
         if (i == 0) {
             b.startKey = (newseg_lower == 0 && data[start] == 0)
@@ -55,10 +55,10 @@ vector<Block<KeyType>> computeBlocks(const vector<KeyType>& data,
         } else {
             b.startKey = data[start];
         }
-        if (end == (n - 1)) {
+        if (end == n) {
             // b.endKey = newseg_upper == 0 ? data[end] + 1 : newseg_upper;
             if (newseg_upper == 0) {
-                b.endKey = (data[end] == UINT64_MAX) ? UINT64_MAX : data[end] + 1;
+                b.endKey = (data[end - 1] == UINT64_MAX) ? UINT64_MAX : data[end - 1] + 1;
             } else {
                 b.endKey = newseg_upper;
             }
