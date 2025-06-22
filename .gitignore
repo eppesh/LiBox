@@ -1,0 +1,6 @@
+.vscode
+*.csv
+partition_optimization
+ratio_by_win
+outputs
+ratio_by_win.dSYM

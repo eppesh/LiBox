@@ -15,3 +15,9 @@ debug:
 
 clean:
 	rm -f $(TARGET) $(TARGET)_debug
+
+partition:
+	g++ -std=c++17 -O3 src/partition_optimization.cpp -o partition_optimization
+
+graph:
+	g++ -std=c++17 -O3 src/ratio_by_win.cpp -o ratio_by_win
