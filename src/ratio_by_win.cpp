@@ -117,7 +117,7 @@ void calc_graph(vector<KeyType>& data,
     FileGuard guard(outfile);
 
     // csv header
-    outfile << "window_size,segment_length,underflow_ratio,overflow_ratio\n";
+    outfile << "window_size,segment_length,num_keys,underflow_ratio,overflow_ratio\n";
 
     processData(data, start_percent, end_percent);
 
@@ -135,8 +135,9 @@ void calc_graph(vector<KeyType>& data,
                 return;
             }*/ // DEBUG
 
-            outfile << window_size << "," << i + 1 << "," << underflow_ratio << ","
-                    << overflow_ratio << "\n";
+            outfile << window_size << "," << i + 1 << ","
+                    << countKeysInInterval(data, data.begin(), seg.seg_upper) << ','
+                    << underflow_ratio << "," << overflow_ratio << "\n";
         }
     }
 }
