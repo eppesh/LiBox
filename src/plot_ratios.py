@@ -12,6 +12,9 @@ import numpy as np
 import sys
 import os
 
+OVERFLOW_THRESHOLD = 0.2
+UNDERFLOW_THRESHOLD = 0.5
+
 def load_data(csv_file='out.csv'):
     if not os.path.exists(csv_file):
         print(f"Error: CSV file '{csv_file}' not found")
@@ -57,6 +60,9 @@ def plot_ratios(df, output_file=None, show_plot=True):
                 linewidth=2,
                 label=f'Overflow (Window: {window_size:,})')
     
+    plt.axhline(y=OVERFLOW_THRESHOLD, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Overflow Threshold ({OVERFLOW_THRESHOLD})')
+    plt.axhline(y=UNDERFLOW_THRESHOLD, color='red', linestyle='-', linewidth=2, alpha=0.7, label=f'Underflow Threshold ({UNDERFLOW_THRESHOLD})')
+    
     plt.xlabel('Segment Length', fontsize=14)
     plt.ylabel('Ratio', fontsize=14)
     plt.title('Overflow and Underflow Ratios by Segment Length and Window Size', fontsize=16)
@@ -94,6 +100,8 @@ def plot_separate_ratios(df, output_file=None, show_plot=True):
                 color=colors[i], 
                 linewidth=2,
                 label=f'Window: {window_size:,}')
+
+    ax1.axhline(y=UNDERFLOW_THRESHOLD, color='red', linestyle=':', linewidth=2, alpha=0.7, label=f'Threshold ({UNDERFLOW_THRESHOLD})')
     
     ax1.set_xlabel('Segment Length', fontsize=12)
     ax1.set_ylabel('Underflow Ratio', fontsize=12)
@@ -108,6 +116,8 @@ def plot_separate_ratios(df, output_file=None, show_plot=True):
                 color=colors[i], 
                 linewidth=2,
                 label=f'Window: {window_size:,}')
+
+    ax2.axhline(y=OVERFLOW_THRESHOLD, color='red', linestyle=':', linewidth=2, alpha=0.7, label=f'Threshold ({OVERFLOW_THRESHOLD})')
     
     ax2.set_xlabel('Segment Length', fontsize=12)
     ax2.set_ylabel('Overflow Ratio', fontsize=12)

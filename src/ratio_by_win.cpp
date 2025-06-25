@@ -131,42 +131,88 @@ void calc_graph(vector<KeyType>& data,
             double underflow_ratio = computeUnderflowRatioAccurate(data, seg);
             double overflow_ratio = computeOverflowRatioNoUpperBound(data, seg);
 
+            /*if (overflow_ratio > 0.1 || underflow_ratio > 0.5) {
+                return;
+            }*/ // DEBUG
+
             outfile << window_size << "," << i + 1 << "," << underflow_ratio << ","
                     << overflow_ratio << "\n";
         }
     }
 }
 
-// Helper function to format numbers in scientific notation
-string toScientificNotation(KeyType value) {
-    if (value < 1000) {
-        return to_string(value);
+string toScientificNotation(double value) {
+    if (value == 0.0) {
+        return "0";
+    }
+
+    if (value < 1.0 && value > 0.0) {
+        ostringstream oss;
+        oss << scientific << setprecision(0) << value;
+        string result = oss.str();
+
+        size_t e_pos = result.find('e');
+        if (e_pos != string::npos) {
+            string mantissa = result.substr(0, e_pos);
+            string exponent = result.substr(e_pos + 2);
+
+            while (mantissa.back() == '0') {
+                mantissa.pop_back();
+            }
+            if (mantissa.back() == '.') {
+                mantissa.pop_back();
+            }
+
+            size_t i = 0;
+            while (exponent[i] == '0') {
+                i++;
+            }
+
+            return mantissa + "e-" + exponent.substr(i);
+        }
+        return result;
+    }
+
+    if (value < 1000.0 && value == static_cast<int64_t>(value)) {
+        return to_string(static_cast<int64_t>(value));
+    }
+
+    if (value >= 1000.0) {
+        ostringstream oss;
+        oss << scientific << setprecision(0) << value;
+        string result = oss.str();
+
+        size_t e_pos = result.find('e');
+        if (e_pos != string::npos) {
+            string mantissa = result.substr(0, e_pos);
+            string exponent = result.substr(e_pos + 2); // remove e+
+
+            while (mantissa.back() == '0') {
+                mantissa.pop_back();
+            }
+            if (mantissa.back() == '.') {
+                mantissa.pop_back();
+            }
+
+            size_t i = 0;
+            while (exponent[i] == '0') {
+                i++;
+            }
+
+            return mantissa + "e" + exponent.substr(i);
+        }
+        return result;
     }
 
     ostringstream oss;
-    oss << scientific << setprecision(0) << static_cast<double>(value);
+    oss << fixed << setprecision(6) << value;
     string result = oss.str();
 
-    // Remove trailing zeros and decimal point if not needed
-    size_t e_pos = result.find('e');
-    if (e_pos != string::npos) {
-        string mantissa = result.substr(0, e_pos);
-        string exponent = result.substr(e_pos + 2); // remove e+
-
-        // Remove trailing zeros and decimal point
-        while (mantissa.back() == '0') {
-            mantissa.pop_back();
-        }
-        if (mantissa.back() == '.') {
-            mantissa.pop_back();
-        }
-
-        size_t i = 0;
-        while (exponent[i] == '0') {
-            i++;
-        }
-
-        return mantissa + "e" + exponent.substr(i);
+    while (result.back() == '0') {
+        result.pop_back();
+    }
+    if (result.back() == '.') {
+        result.pop_back();
     }
 
     return result;
@@ -208,8 +254,8 @@ int main(int argc, char* argv[]) {
     }
 
     string output_file = "len" + toScientificNotation(data.size()) + "_p" +
-                         to_string(static_cast<int>(start_percent * 100)) + "t" +
-                         to_string(static_cast<int>(end_percent * 100)) + "_r" +
+                         toScientificNotation(start_percent * 100) + "t" +
+                         toScientificNotation(end_percent * 100) + "_r" +
                          toScientificNotation(window_start) + "t" +
                          toScientificNotation(window_end) + ".csv";
 

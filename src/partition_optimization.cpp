@@ -127,6 +127,8 @@ int main(int argc, char* argv[]) {
     fout.close();
     cout << "Window range of first segment (for testing purposes): " << finalSegments[0].box_range
          << endl; // DEBUG
+    cout << "Number of boxes of first segment (for testing purposes): "
+         << finalSegments[0].endIndex - finalSegments[0].startIndex << endl; // DEBUG
     cout << "Segmentation results saved to " << output_file << endl;
     return 0;
 }
