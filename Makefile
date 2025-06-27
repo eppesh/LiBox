@@ -16,8 +16,11 @@ debug:
 clean:
 	rm -f $(TARGET) $(TARGET)_debug
 
+MAC_FLAGS = -std=c++17 -g
+
 partition:
-	g++ -std=c++17 -O3 src/partition_optimization.cpp -o partition_optimization
+	$(CXX) $(MAC_FLAGS) src/partition_optimization.cpp -o partition_optimization
 
 graph:
-	g++ -std=c++17 -O3 src/ratio_by_win.cpp -o ratio_by_win
+	$(CXX) $(MAC_FLAGS) src/ratio_by_win.cpp -o ratio_by_win
+	$(CXX) $(MAC_FLAGS) src/seg_len_by_win.cpp -o seg_len_by_win

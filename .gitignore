@@ -2,5 +2,7 @@
 *.csv
 partition_optimization
 ratio_by_win
+seg_len_by_win
 outputs
-ratio_by_win.dSYM
+*.dSYM
+*.png
