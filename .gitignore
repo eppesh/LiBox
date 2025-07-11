@@ -3,6 +3,8 @@
 partition_optimization
 ratio_by_win
 seg_len_by_win
+segmentation
+src/__pycache__
 outputs
 *.dSYM
 *.png

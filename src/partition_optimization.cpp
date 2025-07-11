@@ -8,6 +8,8 @@ using namespace liboxns;
 
 using KeyType = int64_t; // vmware&cambridge uint32_t; longitudes-200M int64_T
 
+const int SHRINK_FACTOR = 100;
+
 bool load_data(const std::string& input, std::vector<KeyType>& data) {
     std::ifstream fin(input);
     if (!fin) {
@@ -60,6 +62,22 @@ bool load_data(const std::string& input, std::vector<KeyType>& data) {
     return true;
 }
 
+void process_data_shrink(std::vector<KeyType>& data) {
+    sort(data.begin(), data.end());
+    data.erase(unique(data.begin(), data.end()), data.end());
+
+    vector<KeyType> shrunk_data;
+    for (size_t i = 0; i < data.size(); i += SHRINK_FACTOR) {
+        shrunk_data.push_back(data[i]);
+    }
+    data = std::move(shrunk_data);
+}
+
+void process_data(std::vector<KeyType>& data) {
+    sort(data.begin(), data.end());
+    data.erase(unique(data.begin(), data.end()), data.end());
+}
+
 int main(int argc, char* argv[]) {
     // Modify the 'KeyType' as needed
     if (argc < 3) {
@@ -79,8 +97,9 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Finish loading the data. Original data size=" << data.size() << std::endl;
 
-    sort(data.begin(), data.end());
-    data.erase(unique(data.begin(), data.end()), data.end());
+    // SHRINK!
+    process_data(data);
+    // process_data_shrink(data);
     std::cout << "data size=" << data.size() << ", min=" << data.front() << ", max=" << data.back()
               << std::endl;
     vector<Block<KeyType>> blocks = computeBlocks(data, BLOCK_SIZE);
@@ -88,6 +107,7 @@ int main(int argc, char* argv[]) {
               << "; lower=" << blocks.back().startKey << ", upper=" << blocks.back().endKey
               << ", range=" << blocks.back().range << std::endl;
 
+    // SHRINK!
     int maxMergeCount = 3;
     double underflowThreshold = 0.5;
     double overflowThreshold = 0.1;
@@ -122,13 +142,15 @@ int main(int argc, char* argv[]) {
             start = end;
             end = finalSegments[i].seg_upper;
         }
+        // SHRINK!
         fout << start << "," << end << "," << finalSegments[i].box_range << "\n";
+        // fout << start << "," << end << "," << finalSegments[i].box_range / SHRINK_FACTOR << "\n";
     }
     fout.close();
     cout << "Window range of first segment (for testing purposes): " << finalSegments[0].box_range
          << endl; // DEBUG
     cout << "Number of boxes of first segment (for testing purposes): "
-         << finalSegments[0].endIndex - finalSegments[0].startIndex << endl; // DEBUG
+         << finalSegments[0].endIndex - finalSegments[0].startIndex + 1 << endl; // DEBUG
     cout << "Segmentation results saved to " << output_file << endl;
     return 0;
 }

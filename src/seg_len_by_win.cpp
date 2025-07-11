@@ -16,7 +16,6 @@ const double OVERFLOW_THRESHOLD = 0.1;
 
 using KeyType = int64_t;
 
-// no max merge count
 template <typename KeyType>
 StructSegment<KeyType> createMaxSegment(const vector<Block<KeyType>>& blocks,
                                         const vector<KeyType>& data,

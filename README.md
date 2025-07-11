@@ -28,6 +28,7 @@ sudo yum install gcc-c++ libomp-devel
 ## Getting Started
 
 LiBox consists of three main components:
+
 - **libox.h**: Core learned index library with insert, search, and range query functionality
 - **libox_utils.h**: Utility functions for resegment partitioning and optimization
 - **partition_optimization.cpp**: Data analysis tool for generating optimal configuration files
@@ -132,7 +133,7 @@ Contains utility functions for resegment partitioning and optimization algorithm
 This tool analyzes your dataset characteristics and generates optimal segment configurations:
 
 - Analyzes key distribution patterns
-- Calculates optimal segment boundaries  
+- Calculates optimal segment boundaries
 - Determines appropriate box ranges for each segment
 - Outputs optimized configuration file
 
@@ -163,17 +164,17 @@ LiBox employs a three-tier hierarchical structure with intelligent resegment cap
 
 ## Benchmark Parameters
 
-| Parameter | Description | Example Values |
-|-----------|-------------|----------------|
-| `--keys_file` | Path to input dataset file | `sample/sample_keys.txt` |
-| `--keys_file_type` | File format (text/binary) | `text` |
-| `--config_file_path` | Path to segment configuration | `sample/sample_config.csv` |
-| `--init_num_keys` | Initial number of keys to load | `1000000` |
-| `--total_num_keys` | Total keys in dataset | `2000000` |
-| `--batch_size` | Operations per batch | `10000` |
-| `--insert_frac` | Fraction of insert operations | `0.5` (50% inserts) |
-| `--thread_num` | Number of threads | `4` |
-| `--print_batch_stats` | Enable detailed statistics | (flag) |
+| Parameter             | Description                    | Example Values             |
+| --------------------- | ------------------------------ | -------------------------- |
+| `--keys_file`         | Path to input dataset file     | `sample/sample_keys.txt`   |
+| `--keys_file_type`    | File format (text/binary)      | `text`                     |
+| `--config_file_path`  | Path to segment configuration  | `sample/sample_config.csv` |
+| `--init_num_keys`     | Initial number of keys to load | `1000000`                  |
+| `--total_num_keys`    | Total keys in dataset          | `2000000`                  |
+| `--batch_size`        | Operations per batch           | `10000`                    |
+| `--insert_frac`       | Fraction of insert operations  | `0.5` (50% inserts)        |
+| `--thread_num`        | Number of threads              | `4`                        |
+| `--print_batch_stats` | Enable detailed statistics     | (flag)                     |
 
 ## Configuration File Format
 
@@ -187,8 +188,9 @@ lower_bound,upper_bound,box_range
 ```
 
 Each line specifies:
+
 - **lower_bound**: Starting key value for the segment
-- **upper_bound**: Ending key value for the segment  
+- **upper_bound**: Ending key value for the segment
 - **box_range**: Key range per box within the segment
 
 ## Sample Data Files
@@ -196,6 +198,7 @@ Each line specifies:
 The `sample/` directory contains example files for quick testing:
 
 ### sample/sample_keys.txt
+
 ```
 1
 2
@@ -207,6 +210,7 @@ The `sample/` directory contains example files for quick testing:
 ```
 
 ### sample/sample_config.csv
+
 ```
 0,500,50
 501,1000,50
@@ -218,6 +222,7 @@ The `sample/` directory contains example files for quick testing:
 ### For New Datasets
 
 1. **Analyze and Generate Configuration**:
+
    ```bash
    ./test/partition_optimization --input_file=your_data.csv --output_config=optimized_segment.csv
    ```
