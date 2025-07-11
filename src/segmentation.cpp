@@ -158,6 +158,9 @@ std::vector<KeyType> getWindowCandidates(const std::vector<KeyType>& data,
     return win_candidates;
 }
 
+// debug
+long long wind_cand_idx_sum = 0;
+
 template <typename KeyType>
 std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data,
                                                 const double overflow_threshold,
@@ -177,6 +180,14 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
                                                max_look_ahead);
         cur_idx = seg.end_idx;
         cur_key = seg.end_key;
+
+        // debug
+        int win_idx = std::lower_bound(window_candidates.begin(),
+                                       window_candidates.end(),
+                                       seg.window_size) -
+                      window_candidates.begin();
+        wind_cand_idx_sum += win_idx;
+        // end debug
 
         if (cur_idx < data.size() && (data[cur_idx] < cur_key || data[cur_idx - 1] >= cur_key)) {
             std::cout << "also oh no"; // debug
@@ -236,6 +247,10 @@ int main(int argc, char* argv[]) {
     // Calculate segments
     std::vector<Segment<KeyType>> segments =
         calculateSegments(data, overflow_threshold, underflow_threshold, max_look_ahead);
+
+    // debug
+    std::cout << "avg window candidate index: "
+              << static_cast<double>(wind_cand_idx_sum) / segments.size() << std::endl;
 
     // Generate output filename
     std::string output_file = input_file.substr(0, input_file.find_last_of('.')) + "_segments.csv";
