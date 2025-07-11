@@ -133,14 +133,20 @@ std::vector<KeyType> getWindowCandidates(const std::vector<KeyType>& data,
     std::vector<KeyType> win_samples;
     size_t cur_idx = start_idx;
     KeyType cur_key = start_key;
+    bool breaked_early = false;
     for (int i = 0; i < MAX_NUM_SAMPLES; i++) {
         cur_idx += BOX_CAPACITY;
-        if (cur_idx >= data.size()) break;
+        if (cur_idx >= data.size()) {
+            breaked_early = true;
+            break;
+        }
 
         win_samples.push_back(data[cur_idx] - cur_key);
         cur_key = data[cur_idx];
     }
-    win_samples.push_back(data[data.size() - 1] - cur_key + 1);
+    if (breaked_early) {
+        win_samples.push_back(data[data.size() - 1] - cur_key + 1);
+    }
 
     std::sort(win_samples.begin(), win_samples.end());
 
@@ -253,7 +259,8 @@ int main(int argc, char* argv[]) {
               << static_cast<double>(wind_cand_idx_sum) / segments.size() << std::endl;
 
     // Generate output filename
-    std::string output_file = input_file.substr(0, input_file.find_last_of('.')) + "_segments.csv";
+    std::string output_file = input_file.substr(0, input_file.find_last_of('.')) + "_segments_N" +
+                              std::to_string(max_look_ahead) + "_.csv";
 
     // Write results to CSV file
     std::ofstream outfile(output_file);
@@ -263,7 +270,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Write header
-    outfile << "seg_start_key,seg_end_key,window_size" << std::endl;
+    // outfile << "seg_start_key,seg_end_key,window_size" << std::endl;
 
     // Write segment data
     for (const auto& seg : segments) {
