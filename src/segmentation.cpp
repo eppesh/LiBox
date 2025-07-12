@@ -150,7 +150,7 @@ std::vector<KeyType> getWindowCandidates(const std::vector<KeyType>& data,
 
     std::sort(win_samples.begin(), win_samples.end());
 
-    const size_t NUM_BETWEEN = 1;
+    const size_t NUM_BETWEEN = 0;
     std::vector<KeyType> win_candidates;
     for (int i = 0; i < win_samples.size() - 1; i++) {
         win_candidates.push_back(win_samples[i]);
@@ -260,7 +260,7 @@ int main(int argc, char* argv[]) {
 
     // Generate output filename
     std::string output_file = input_file.substr(0, input_file.find_last_of('.')) + "_segments_N" +
-                              std::to_string(max_look_ahead) + "_.csv";
+                              std::to_string(max_look_ahead) + ".csv";
 
     // Write results to CSV file
     std::ofstream outfile(output_file);
