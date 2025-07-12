@@ -1,6 +1,7 @@
 #include <stddef.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -11,7 +12,7 @@
 /*#include "libox_utils.h"
 using namespace liboxns;*/
 
-const size_t BOX_CAPACITY = 64;
+const size_t BOX_SIZE = 64;
 
 template <typename KeyType>
 struct Segment {
@@ -42,7 +43,21 @@ struct Segment {
     }
 };
 
-using KeyType = int64_t;
+template <typename KeyType>
+size_t find_lower(const std::vector<KeyType>& data,
+                  const size_t start_ind,
+                  const size_t end_ind,
+                  const KeyType key) {
+    size_t cur_ind = start_ind;
+    auto end = std::min(end_ind, data.size());
+    while (cur_ind < end) {
+        if (data[cur_ind] >= key) {
+            return cur_ind;
+        }
+        cur_ind++;
+    }
+    return cur_ind;
+}
 
 // Makes the largest segment it can with window_size, starting at start_idx, where the
 // over/underflow ratios are under the thresholds. Looks ahead at most max_look_ahead when the
@@ -66,17 +81,31 @@ Segment<KeyType> makeSegment(const std::vector<KeyType>& data,
     while (seg.end_idx < data.size() && num_look_ahead < max_look_ahead) {
         // exclusive
         KeyType new_end_key = std::min(seg.end_key + window_size, data[data.size() - 1] + 1);
-        size_t new_end_idx = std::lower_bound(seg.end_idx + data.begin(), data.end(), new_end_key) -
-                             data.begin();
+
+        size_t new_end_idx = find_lower(data, seg.end_idx, seg.end_idx + BOX_SIZE * 2, new_end_key);
+
+        // debug
+        // size_t test_new_end_idx = std::lower_bound(seg.end_idx + data.begin(), data.end(),
+        // new_end_key) -
+        //                      data.begin();
+
+        // if (new_end_idx < seg.end_idx + BOX_SIZE * 2 && new_end_idx != test_new_end_idx) {
+        //     std::cout << "uhhhhhhhhhh\n";
+        // }
+
         size_t num_keys = new_end_idx - seg.end_idx;
+        if (num_keys >= BOX_SIZE * 2) {
+            break;
+        }
+
         seg.cum_keys += num_keys;
         seg.end_idx = new_end_idx;
         seg.end_key = new_end_key;
 
-        if (num_keys > BOX_CAPACITY) {
-            seg.cum_overflow += (num_keys - BOX_CAPACITY);
+        if (num_keys > BOX_SIZE) {
+            seg.cum_overflow += (num_keys - BOX_SIZE);
         } else {
-            seg.cum_underflow += (BOX_CAPACITY - num_keys);
+            seg.cum_underflow += (BOX_SIZE - num_keys);
         }
 
         double overflow_ratio = (seg.cum_keys > 0)
@@ -135,7 +164,7 @@ std::vector<KeyType> getWindowCandidates(const std::vector<KeyType>& data,
     KeyType cur_key = start_key;
     bool breaked_early = false;
     for (int i = 0; i < MAX_NUM_SAMPLES; i++) {
-        cur_idx += BOX_CAPACITY;
+        cur_idx += BOX_SIZE;
         if (cur_idx >= data.size()) {
             breaked_early = true;
             break;
@@ -205,6 +234,54 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
     return segments;
 }
 
+#include "libox_utils.h"
+using namespace liboxns;
+
+template <typename KeyType>
+bool validateSegments(const std::vector<KeyType>& data,
+                      const std::vector<Segment<KeyType>>& my_segs) {
+    std::vector<StructSegment<KeyType>> segs;
+    for (const Segment<KeyType>& my_seg : my_segs) {
+        StructSegment<KeyType> seg;
+        seg.seg_lower = my_seg.start_key;
+        seg.seg_upper = my_seg.end_key;
+        seg.box_range = my_seg.window_size;
+        segs.push_back(seg);
+    }
+
+    KeyType start_key = data[0];
+    KeyType end_key = data[0];
+    size_t total_keys = 0;
+    for (int i = 0; i < segs.size(); i++) {
+        const StructSegment<KeyType>& seg = segs[i];
+        if (seg.seg_lower != end_key) {
+            return false;
+        }
+        start_key = end_key;
+        end_key = seg.seg_upper;
+        if (computeUnderflowRatioAccurate(data, seg) > 0.5 ||
+            computeOverflowRatioAccurate(data, seg) > 0.1) {
+            return false;
+        }
+
+        auto start_it = std::lower_bound(data.begin(), data.end(), start_key);
+        int num_keys = countKeysInInterval(data,
+                                           start_it,
+                                           end_key - 1); // the method expects inclusive
+        if (num_keys != my_segs[i].cum_keys) {
+            return false;
+        }
+        total_keys += num_keys;
+    }
+
+    if (end_key != data[data.size() - 1] + 1) return false;
+    if (total_keys != data.size()) return false;
+
+    return true;
+}
+
+using KeyType = int64_t;
+
 int main(int argc, char* argv[]) {
     // Check command line arguments
     if (argc < 3) {
@@ -250,13 +327,29 @@ int main(int argc, char* argv[]) {
               << ", overflow_threshold=" << overflow_threshold
               << ", underflow_threshold=" << underflow_threshold << std::endl;
 
-    // Calculate segments
+    // Calculate segments with high-resolution timing
+    auto start_time = std::chrono::high_resolution_clock::now();
     std::vector<Segment<KeyType>> segments =
         calculateSegments(data, overflow_threshold, underflow_threshold, max_look_ahead);
+    auto end_time = std::chrono::high_resolution_clock::now();
+
+    auto duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(end_time -
+                                                                                       start_time);
+    auto duration_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(end_time -
+                                                                                      start_time);
+    std::cout << "calculateSegments execution time: " << duration_microseconds.count()
+              << " microseconds (" << duration_seconds.count() << " seconds)" << std::endl;
 
     // debug
     std::cout << "avg window candidate index: "
               << static_cast<double>(wind_cand_idx_sum) / segments.size() << std::endl;
+
+    bool valid = validateSegments(data, segments);
+    if (valid) {
+        std::cout << "Confirmed that the segments are valid!!" << std::endl;
+    } else {
+        std::cout << "ERROR/WARNING THE SEGMENTS ARE NOT VALID NOOOOOOO" << std::endl;
+    }
 
     // Generate output filename
     std::string output_file = input_file.substr(0, input_file.find_last_of('.')) + "_segments_N" +
