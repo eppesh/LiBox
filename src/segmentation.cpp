@@ -72,10 +72,11 @@ Segment<KeyType> makeSegment(const std::vector<KeyType>& data,
                              const size_t max_look_ahead) {
     Segment<KeyType> seg(start_idx, start_key, window_size);
     Segment<KeyType> valid_seg(start_idx, start_key, window_size);
-
+#ifndef NDEBUG
     if (data[start_idx] < start_key || (start_idx != 0 && data[start_idx - 1] >= start_key)) {
         std::cout << "uh oh\n"; // debug
     }
+#endif
 
     size_t num_look_ahead = 0;
     while (seg.end_idx < data.size() && num_look_ahead < max_look_ahead) {
@@ -84,14 +85,14 @@ Segment<KeyType> makeSegment(const std::vector<KeyType>& data,
 
         size_t new_end_idx = find_lower(data, seg.end_idx, seg.end_idx + BOX_SIZE * 2, new_end_key);
 
-        // debug
-        // size_t test_new_end_idx = std::lower_bound(seg.end_idx + data.begin(), data.end(),
-        // new_end_key) -
-        //                      data.begin();
+#ifndef NDEBUG
+        size_t test_new_end_idx =
+            std::lower_bound(seg.end_idx + data.begin(), data.end(), new_end_key) - data.begin();
 
-        // if (new_end_idx < seg.end_idx + BOX_SIZE * 2 && new_end_idx != test_new_end_idx) {
-        //     std::cout << "uhhhhhhhhhh\n";
-        // }
+        if (new_end_idx < seg.end_idx + BOX_SIZE * 2 && new_end_idx != test_new_end_idx) {
+            std::cout << "uhhhhhhhhhh\n";
+        }
+#endif
 
         size_t num_keys = new_end_idx - seg.end_idx;
         if (num_keys >= BOX_SIZE * 2) {
@@ -143,14 +144,17 @@ Segment<KeyType> findBestSegment(const std::vector<KeyType>& data,
                                            overflow_threshold,
                                            underflow_threshold,
                                            max_look_ahead);
-        if (seg.window_size == 0) {
-            std::cout << "uhhhhh\n"; // debug
-        }
+
         if (seg.cum_keys > max_keys) {
             max_keys = seg.cum_keys;
             best_seg = seg;
         }
     }
+#ifndef NDEBUG
+    if (best_seg.cum_keys < BOX_SIZE) {
+        std::cout << "not good guys\n";
+    }
+#endif
     return best_seg;
 }
 
@@ -158,7 +162,7 @@ template <typename KeyType>
 std::vector<KeyType> getWindowCandidates(const std::vector<KeyType>& data,
                                          const size_t start_idx,
                                          const KeyType start_key) {
-    const size_t MAX_NUM_SAMPLES = 30;
+    const size_t MAX_NUM_SAMPLES = 10;
     std::vector<KeyType> win_samples;
     size_t cur_idx = start_idx;
     KeyType cur_key = start_key;
@@ -193,8 +197,10 @@ std::vector<KeyType> getWindowCandidates(const std::vector<KeyType>& data,
     return win_candidates;
 }
 
+#ifndef NDEBUG
 // debug
 long long wind_cand_idx_sum = 0;
+#endif
 
 template <typename KeyType>
 std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data,
@@ -216,6 +222,7 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
         cur_idx = seg.end_idx;
         cur_key = seg.end_key;
 
+#ifndef NDEBUG
         // debug
         int win_idx = std::lower_bound(window_candidates.begin(),
                                        window_candidates.end(),
@@ -227,6 +234,7 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
         if (cur_idx < data.size() && (data[cur_idx] < cur_key || data[cur_idx - 1] >= cur_key)) {
             std::cout << "also oh no"; // debug
         }
+#endif
 
         segments.push_back(seg);
     }
@@ -286,7 +294,8 @@ int main(int argc, char* argv[]) {
     // Check command line arguments
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <input_csv_file> <max_look_ahead> [overflow_threshold] [underflow_threshold]"
+                  << " <input_csv_file> <max_look_ahead> [overflow_threshold] "
+                     "[underflow_threshold]"
                   << std::endl;
         std::cerr << "  overflow_threshold defaults to 0.1" << std::endl;
         std::cerr << "  underflow_threshold defaults to 0.5" << std::endl;
@@ -340,6 +349,7 @@ int main(int argc, char* argv[]) {
     std::cout << "calculateSegments execution time: " << duration_microseconds.count()
               << " microseconds (" << duration_seconds.count() << " seconds)" << std::endl;
 
+#ifndef NDEBUG
     // debug
     std::cout << "avg window candidate index: "
               << static_cast<double>(wind_cand_idx_sum) / segments.size() << std::endl;
@@ -350,6 +360,7 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "ERROR/WARNING THE SEGMENTS ARE NOT VALID NOOOOOOO" << std::endl;
     }
+#endif
 
     // Generate output filename
     std::string output_file = input_file.substr(0, input_file.find_last_of('.')) + "_segments_N" +
@@ -370,7 +381,9 @@ int main(int argc, char* argv[]) {
         if (seg.start_idx < data.size() && seg.end_idx <= data.size()) {
             outfile << seg.start_key << "," << seg.end_key << "," << seg.window_size << std::endl;
         } else {
+#ifndef NDEBUG
             std::cout << "somethings wrong..."; // debug
+#endif
         }
     }
 
