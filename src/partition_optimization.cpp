@@ -2,13 +2,11 @@
 #include <iostream>
 #include <sstream>
 
-#include "libox_utils.h"
+#include "segmentation.h"
 
 using namespace liboxns;
 
 using KeyType = int64_t; // vmware&cambridge uint32_t; longitudes-200M int64_T
-
-const int SHRINK_FACTOR = 100;
 
 bool load_data(const std::string& input, std::vector<KeyType>& data) {
     std::ifstream fin(input);
@@ -62,16 +60,16 @@ bool load_data(const std::string& input, std::vector<KeyType>& data) {
     return true;
 }
 
-void process_data_shrink(std::vector<KeyType>& data) {
-    sort(data.begin(), data.end());
-    data.erase(unique(data.begin(), data.end()), data.end());
+// void process_data_shrink(std::vector<KeyType>& data) {
+//     sort(data.begin(), data.end());
+//     data.erase(unique(data.begin(), data.end()), data.end());
 
-    vector<KeyType> shrunk_data;
-    for (size_t i = 0; i < data.size(); i += SHRINK_FACTOR) {
-        shrunk_data.push_back(data[i]);
-    }
-    data = std::move(shrunk_data);
-}
+//     vector<KeyType> shrunk_data;
+//     for (size_t i = 0; i < data.size(); i += SHRINK_FACTOR) {
+//         shrunk_data.push_back(data[i]);
+//     }
+//     data = std::move(shrunk_data);
+// }
 
 void process_data(std::vector<KeyType>& data) {
     sort(data.begin(), data.end());
@@ -102,29 +100,39 @@ int main(int argc, char* argv[]) {
     // process_data_shrink(data);
     std::cout << "data size=" << data.size() << ", min=" << data.front() << ", max=" << data.back()
               << std::endl;
-    vector<Block<KeyType>> blocks = computeBlocks(data, BLOCK_SIZE);
-    std::cout << "Compute blocks finished: block count=" << blocks.size()
-              << "; lower=" << blocks.back().startKey << ", upper=" << blocks.back().endKey
-              << ", range=" << blocks.back().range << std::endl;
 
     // SHRINK!
-    int maxMergeCount = 3;
-    double underflowThreshold = 0.5;
-    double overflowThreshold = 0.1;
-    std::cout << "maxMergeCount=" << maxMergeCount << ", ufthreshold=" << underflowThreshold
-              << ", ofthreshold=" << overflowThreshold << std::endl;
-    vector<StructSegment<KeyType>> initSegments =
-        partitionSegmentsOverall(blocks, data, underflowThreshold, maxMergeCount);
-    std::cout << "initSegments finished! init size=" << initSegments.size() << std::endl;
-    std::cout << "last segment: lower=" << initSegments.back().seg_lower
-              << "; upper=" << initSegments.back().seg_upper
-              << "; range=" << initSegments.back().box_range << std::endl;
-    vector<StructSegment<KeyType>> finalSegments = expandSegments(
-        initSegments, blocks, data, underflowThreshold, overflowThreshold, maxMergeCount);
-    std::cout << "finalSegments finished! final size=" << finalSegments.size() << std::endl;
-    std::cout << "last segment: lower=" << finalSegments.back().seg_lower
-              << "; upper=" << finalSegments.back().seg_upper
-              << "; range=" << finalSegments.back().box_range << std::endl;
+    int max_look_ahead = 15;
+    double underflow_threshold = 0.5;
+    double overflow_threshold = 0.1;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    std::vector<Segment<KeyType>> segments =
+        calculateSegments(data, overflow_threshold, underflow_threshold, max_look_ahead);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::vector<StructSegment<KeyType>> final_segments = toStructSegment(segments);
+
+    std::cout << "Finished creating segments: segment count=" << final_segments.size() << std::endl;
+    if (!final_segments.empty()) {
+        std::cout << "last segment: lower=" << final_segments.back().seg_lower
+                  << "; upper=" << final_segments.back().seg_upper 
+                  << "; range=" << final_segments.back().box_range << std::endl;
+    }
+
+    auto duration_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(end_time -
+                                                                                       start_time);
+    auto duration_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(end_time -
+                                                                                      start_time);
+    std::cout << "calculateSegments execution time: " << duration_microseconds.count()
+              << " microseconds (" << duration_seconds.count() << " seconds)" << std::endl;
+
+#ifndef NDEBUG
+    bool valid = validateSegments(data, segments);
+    if (valid) {
+        std::cout << "Confirmed that the segments are valid!" << std::endl;
+    } else {
+        std::cout << "ERROR/WARNING THE SEGMENTS ARE NOT VALID" << std::endl;
+    }
+#endif
 
     ofstream fout(output_file);
     if (!fout) {
@@ -134,23 +142,19 @@ int main(int argc, char* argv[]) {
 
     KeyType start;
     KeyType end;
-    for (int i = 0; i < finalSegments.size(); i++) {
+    for (int i = 0; i < final_segments.size(); i++) {
         if (i == 0) {
-            start = finalSegments[0].seg_lower;
-            end = finalSegments[0].seg_upper;
+            start = final_segments[0].seg_lower;
+            end = final_segments[0].seg_upper;
         } else {
             start = end;
-            end = finalSegments[i].seg_upper;
+            end = final_segments[i].seg_upper;
         }
         // SHRINK!
-        fout << start << "," << end << "," << finalSegments[i].box_range << "\n";
-        // fout << start << "," << end << "," << finalSegments[i].box_range / SHRINK_FACTOR << "\n";
+        fout << start << "," << end << "," << final_segments[i].box_range << "\n";
+        // fout << start << "," << end << "," << final_segments[i].box_range / SHRINK_FACTOR << "\n";
     }
     fout.close();
-    cout << "Window range of first segment (for testing purposes): " << finalSegments[0].box_range
-         << endl; // DEBUG
-    cout << "Number of boxes of first segment (for testing purposes): "
-         << finalSegments[0].endIndex - finalSegments[0].startIndex + 1 << endl; // DEBUG
     cout << "Segmentation results saved to " << output_file << endl;
     return 0;
 }
