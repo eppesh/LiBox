@@ -26,7 +26,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "libox_utils.h"
+#include "segmentation.h"
 
 #define overflowCapacity 5
 #define maxKey 64
@@ -1314,6 +1314,7 @@ class LiBox {
     }
 
     void splitSegment(int32_t index, int32_t box_index) {
+        std::cout << "am splitting segments now" << std::endl; // debug
         vector<Segment<KeyType, ValueType>> newSegments;
         vector<KeyType> newsegment_start_keys;
         vector<pair<KeyType, ValueType>> mergedEntries;
@@ -1367,18 +1368,15 @@ class LiBox {
             for (const auto& p : mergedEntries) {
                 keys.push_back(p.first);
             }
-            int maxMergeCount = 3;
+            int maxMergeCount = 15;
             double underflowThreshold = 1;
             double overflowThreshold = 0.05;
-            vector<Block<KeyType>> blocks = computeBlocks(keys, 32, merged_lower, merged_upper);
-            vector<StructSegment<KeyType>> initSegments =
-                partitionSegmentsOverall(blocks, keys, underflowThreshold, maxMergeCount);
-            vector<StructSegment<KeyType>> finalSegments = expandSegments(
-                initSegments, blocks, keys, underflowThreshold, overflowThreshold, maxMergeCount);
+            vector<seg::Segment<KeyType>> finalSegments =
+                calculateSegments(keys, underflowThreshold, overflowThreshold, maxMergeCount, merged_lower, merged_upper);
             for (int i = 0; i < finalSegments.size(); i++) {
-                Segment<KeyType, ValueType> newSegment(finalSegments[i].seg_lower,
-                                                       finalSegments[i].seg_upper,
-                                                       finalSegments[i].box_range);
+                Segment<KeyType, ValueType> newSegment(finalSegments[i].start_key,
+                                                       finalSegments[i].end_key,
+                                                       finalSegments[i].window_size);
                 newSegments.push_back(move(newSegment));
                 newsegment_start_keys.push_back(newSegment.getLowerBound());
             }

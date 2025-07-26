@@ -12,34 +12,38 @@
 #include "libox_utils.h"
 using namespace liboxns;
 
-template <typename KeyType>
-struct Segment {
-    size_t start_idx;
-    KeyType start_key;
-    size_t end_idx; // exclusive
-    KeyType end_key;
-    KeyType window_size;
+namespace seg {
+    template <typename KeyType>
+    struct Segment {
+        size_t start_idx;
+        KeyType start_key;
+        size_t end_idx; // exclusive
+        KeyType end_key;
+        KeyType window_size;
 
-    size_t cum_keys = 0;
-    size_t cum_underflow = 0;
-    size_t cum_overflow = 0;
+        size_t cum_keys = 0;
+        size_t cum_underflow = 0;
+        size_t cum_overflow = 0;
 
-    Segment(const size_t start_i, KeyType start_k, KeyType window) {
-        start_idx = start_i;
-        end_idx = start_i;
-        start_key = start_k;
-        end_key = start_k;
-        window_size = window;
-    }
+        Segment(const size_t start_i, KeyType start_k, KeyType window) {
+            start_idx = start_i;
+            end_idx = start_i;
+            start_key = start_k;
+            end_key = start_k;
+            window_size = window;
+        }
 
-    void expand_to(const Segment<KeyType>& seg) {
-        end_idx = seg.end_idx;
-        end_key = seg.end_key;
-        cum_keys = seg.cum_keys;
-        cum_underflow = seg.cum_underflow;
-        cum_overflow = seg.cum_overflow;
-    }
-};
+        void expand_to(const Segment<KeyType>& seg) {
+            end_idx = seg.end_idx;
+            end_key = seg.end_key;
+            cum_keys = seg.cum_keys;
+            cum_underflow = seg.cum_underflow;
+            cum_overflow = seg.cum_overflow;
+        }
+    };
+}
+
+using namespace seg;
 
 template <typename KeyType>
 size_t find_lower(const std::vector<KeyType>& data,
@@ -217,10 +221,12 @@ template <typename KeyType>
 std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data,
                                                 const double overflow_threshold,
                                                 const double underflow_threshold,
-                                                const size_t max_look_ahead) {
+                                                const size_t max_look_ahead,
+                                                const KeyType newseg_lower,
+                                                const KeyType newseg_upper) {
     std::vector<Segment<KeyType>> segments;
     size_t cur_idx = 0;
-    KeyType cur_key = data[0];
+    KeyType cur_key = newseg_lower <= data[0] ? newseg_lower : data[0];
     while (cur_idx < data.size() && cur_key <= data.back() + 1) {
         std::vector<KeyType> window_candidates = getWindowCandidates(data, cur_idx, cur_key);
         Segment<KeyType> seg = findBestSegment(data,
@@ -249,6 +255,9 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
 
         segments.push_back(seg);
     }
+
+    Segment<KeyType> &last_seg = segments.back();
+    if (newseg_upper >= last_seg.end_key) last_seg.end_key = newseg_upper;
 
     return segments;
 }
