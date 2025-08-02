@@ -13,35 +13,35 @@
 using namespace liboxns;
 
 namespace seg {
-    template <typename KeyType>
-    struct Segment {
-        size_t start_idx;
-        KeyType start_key;
-        size_t end_idx; // exclusive
-        KeyType end_key;
-        KeyType window_size;
+template <typename KeyType>
+struct Segment {
+    size_t start_idx;
+    KeyType start_key;
+    size_t end_idx; // exclusive
+    KeyType end_key;
+    KeyType window_size;
 
-        size_t cum_keys = 0;
-        size_t cum_underflow = 0;
-        size_t cum_overflow = 0;
+    size_t cum_keys = 0;
+    size_t cum_underflow = 0;
+    size_t cum_overflow = 0;
 
-        Segment(const size_t start_i, KeyType start_k, KeyType window) {
-            start_idx = start_i;
-            end_idx = start_i;
-            start_key = start_k;
-            end_key = start_k;
-            window_size = window;
-        }
+    Segment(const size_t start_i, KeyType start_k, KeyType window) {
+        start_idx = start_i;
+        end_idx = start_i;
+        start_key = start_k;
+        end_key = start_k;
+        window_size = window;
+    }
 
-        void expand_to(const Segment<KeyType>& seg) {
-            end_idx = seg.end_idx;
-            end_key = seg.end_key;
-            cum_keys = seg.cum_keys;
-            cum_underflow = seg.cum_underflow;
-            cum_overflow = seg.cum_overflow;
-        }
-    };
-}
+    void expand_to(const Segment<KeyType>& seg) {
+        end_idx = seg.end_idx;
+        end_key = seg.end_key;
+        cum_keys = seg.cum_keys;
+        cum_underflow = seg.cum_underflow;
+        cum_overflow = seg.cum_overflow;
+    }
+};
+} // namespace seg
 
 using namespace seg;
 
@@ -85,7 +85,8 @@ Segment<KeyType> makeSegment(const std::vector<KeyType>& data,
         // exclusive
         KeyType new_end_key = std::min(seg.end_key + window_size, data.back() + 1);
 
-        size_t new_end_idx = find_lower(data, seg.end_idx, seg.end_idx + BOX_CAPACITY * 2, new_end_key);
+        size_t new_end_idx =
+            find_lower(data, seg.end_idx, seg.end_idx + BOX_CAPACITY * 2, new_end_key);
 
 #ifndef NDEBUG
         size_t test_new_end_idx =
@@ -228,6 +229,16 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
     size_t cur_idx = 0;
     KeyType cur_key = newseg_lower <= data[0] ? newseg_lower : data[0];
     while (cur_idx < data.size() && cur_key <= data.back() + 1) {
+        if (data.size() - cur_idx < (1 - underflow_threshold) * BOX_CAPACITY) {
+            // the remaining data cannot be made into a valid box, so we forcibly create an
+            // underflowing segment
+            Segment<KeyType> seg(cur_idx, cur_key, data.back() - cur_key);
+            seg.end_idx = data.size();
+            seg.end_key = data.back() + 1;
+            segments.push_back(seg);
+            break;
+        }
+
         std::vector<KeyType> window_candidates = getWindowCandidates(data, cur_idx, cur_key);
         Segment<KeyType> seg = findBestSegment(data,
                                                cur_idx,
@@ -256,8 +267,8 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
         segments.push_back(seg);
     }
 
-    Segment<KeyType> &last_seg = segments.back();
-    if (newseg_upper >= last_seg.end_key) last_seg.end_key = newseg_upper;
+    Segment<KeyType>& last_seg = segments.back();
+    if (newseg_upper > last_seg.end_key) last_seg.end_key = newseg_upper;
 
     return segments;
 }
