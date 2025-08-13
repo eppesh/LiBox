@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -32,59 +34,133 @@
 #define maxKey 64
 
 volatile int dummy;
-atomic<int> globalVersion{0};
 using namespace std;
 
-class TaskQueue {
-   private:
-    queue<packaged_task<void()>> tasks;
-    mutex mtx;
-    condition_variable cv;
-    bool done = false;
-
-   public:
-    future<void> pushTask(function<void()> task) {
-        packaged_task<void()> packagedTask(move(task));
-        future<void> result = packagedTask.get_future();
-        {
-            unique_lock<mutex> lock(mtx);
-            tasks.push(move(packagedTask));
+namespace liboxns {
+class OpenMPThreadLocalCounter {
+private:
+    struct alignas(64) ThreadCounter {
+        std::atomic<uint32_t> count{0};
+        char padding[60];
+    };
+    
+    std::unique_ptr<ThreadCounter[]> thread_counters_;
+    int thread_num_;
+    
+    int get_thread_slot() const {
+        int thread_id = omp_get_thread_num();
+        if (thread_id >= thread_num_) {
+            thread_id = thread_id % thread_num_;
         }
-        cv.notify_one();
-        return result;
+        return thread_id;
     }
-
-    bool popTask(packaged_task<void()>& task) {
-        unique_lock<mutex> lock(mtx);
-        cv.wait(lock, [this] { return !tasks.empty() || done; });
-        if (tasks.empty()) return false;
-        task = move(tasks.front());
-        tasks.pop();
-        return true;
-    }
-
-    void shutdown() {
-        {
-            unique_lock<mutex> lock(mtx);
-            done = true;
+    
+public:
+    explicit OpenMPThreadLocalCounter(int thread_num) 
+        : thread_num_(thread_num) {
+        assert(thread_num > 0);
+        
+        thread_counters_ = std::make_unique<ThreadCounter[]>(thread_num);
+        
+        for (int i = 0; i < thread_num; i++) {
+            thread_counters_[i].count.store(0, std::memory_order_relaxed);
         }
-        cv.notify_all();
+    }
+    
+    OpenMPThreadLocalCounter(const OpenMPThreadLocalCounter& other) 
+        : thread_num_(other.thread_num_) {
+        thread_counters_ = std::make_unique<ThreadCounter[]>(thread_num_);
+        for (int i = 0; i < thread_num_; i++) {
+            thread_counters_[i].count.store(
+                other.thread_counters_[i].count.load(std::memory_order_relaxed),
+                std::memory_order_relaxed
+            );
+        }
+    }
+    
+    OpenMPThreadLocalCounter(OpenMPThreadLocalCounter&& other) noexcept 
+        : thread_counters_(std::move(other.thread_counters_)),
+          thread_num_(other.thread_num_) {
+    }
+    
+    OpenMPThreadLocalCounter& operator=(const OpenMPThreadLocalCounter& other) {
+        if (this != &other) {
+            thread_num_ = other.thread_num_;
+            thread_counters_ = std::make_unique<ThreadCounter[]>(thread_num_);
+            for (int i = 0; i < thread_num_; i++) {
+                thread_counters_[i].count.store(
+                    other.thread_counters_[i].count.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed
+                );
+            }
+        }
+        return *this;
+    }
+    
+    OpenMPThreadLocalCounter& operator=(OpenMPThreadLocalCounter&& other) noexcept {
+        if (this != &other) {
+            thread_counters_ = std::move(other.thread_counters_);
+            thread_num_ = other.thread_num_;
+        }
+        return *this;
+    }
+    
+    void increment() {
+        int slot = get_thread_slot();
+        thread_counters_[slot].count.fetch_add(1, std::memory_order_relaxed);
+    }
+    
+    uint64_t get_total_count() const {
+        uint64_t total = 0;
+        for (int i = 0; i < thread_num_; i++) {
+            total += thread_counters_[i].count.load(std::memory_order_relaxed);
+        }
+        return total;
+    }
+    
+    std::vector<uint32_t> get_snapshot() const {
+        std::vector<uint32_t> snapshot(thread_num_);
+        for (int i = 0; i < thread_num_; i++) {
+            snapshot[i] = thread_counters_[i].count.load(std::memory_order_acquire);
+        }
+        return snapshot;
+    }
+    
+    bool changed_since_snapshot(const std::vector<uint32_t>& snapshot) const {
+        if (snapshot.size() != static_cast<size_t>(thread_num_)) return true;
+        
+        for (int i = 0; i < thread_num_; i++) {
+            if (thread_counters_[i].count.load(std::memory_order_acquire) != snapshot[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    void print_distribution() const {
+        std::cout << "OpenMP Thread Counter distribution:" << std::endl;
+        for (int i = 0; i < thread_num_; i++) {
+            uint32_t count = thread_counters_[i].count.load(std::memory_order_relaxed);
+            if (count > 0) {
+                std::cout << "Thread[" << i << "] = " << count << std::endl;
+            }
+        }
+        std::cout << "Total: " << get_total_count() << std::endl;
+    }
+    
+    int get_current_thread_slot() const {
+        return get_thread_slot();
+    }
+    
+    int get_thread_num() const {
+        return thread_num_;
     }
 };
-
-auto setThreadAffinity(thread& thr, int core_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-    int rc = pthread_setaffinity_np(thr.native_handle(), sizeof(cpu_set_t), &cpuset);
-}
-
-namespace liboxns {
 enum class InsertStatus {
     SUCCESS,
     FULL,
-    BOUND_ERROR,
     SPLIT,
+    WRITING,
 };
 
 struct InsertResult {
@@ -92,7 +168,19 @@ struct InsertResult {
     int box_index;
 };
 
-enum class SearchStatus { SUCCESS, NOT_FOUND, ERROR };
+enum class DeleteStatus {
+    SUCCESS,
+    NOT_FOUND,
+    SPLIT,
+    ERROR
+};
+
+struct DeleteResult {
+    DeleteStatus status;
+    bool found;
+};
+
+enum class SearchStatus { SUCCESS, NOT_FOUND, ERROR, SPLIT};
 
 template <typename KeyType, typename ValueType>
 struct SearchResult {
@@ -109,9 +197,14 @@ class NoOpLock {
 template <typename KeyType, typename ValueType>
 class OverflowKeyValue {
    private:
-    size_t currentSize = 0;
-    atomic<int> overVersion{0};
-    alignas(64) array<uint8_t, maxKey> keys_low;
+    size_t maxSize = 0;
+    size_t validSize = 0;
+    size_t nearestEmptySlot  = 0;
+    bitset<maxKey> valid_flags; 
+
+    alignas(64) array<ValueType, maxKey> values;
+    alignas(64) array<KeyType, maxKey> keys;
+    alignas(64) array<uint8_t, maxKey> keys_low;   
 
     size_t avx512_filter_keys_optimized(KeyType key_low_bound,
                                         pair<KeyType, ValueType>* result_buffer,
@@ -132,38 +225,34 @@ class OverflowKeyValue {
     }
 
     size_t copyDataWithLimit(pair<KeyType, ValueType>* result, size_t max_count) const {
-        size_t to_copy = min(currentSize, max_count);
-
+        size_t to_copy = min(maxSize, max_count);
         for (size_t i = 0; i < to_copy; i++) {
             result[i] = {keys[i], values[i]};
         }
-
         return to_copy;
     }
 
-   public:
-    alignas(64) array<ValueType, maxKey> values;
-    alignas(64) array<KeyType, maxKey> keys;
-    size_t getTotalCount() const { return currentSize; }
-
-    OverflowKeyValue() {}
-
-    size_t copyAllData(pair<KeyType, ValueType>* result) const {
-        size_t i = 0;
-        for (; i + 8 <= currentSize; i += 8) {
-            __m512i keys_vec = _mm512_load_si512(&keys[i]);
-            __m512i values_vec = _mm512_load_si512(&values[i]);
-            for (int j = 0; j < 8; j++) {
-                result[i + j] = {keys[i + j], values[i + j]};
+    void updateNearestEmptySlot() {  
+        for (size_t i = nearestEmptySlot; i < maxKey; i++) {
+            if (!valid_flags[i]) {
+                nearestEmptySlot = i;
+                return;
             }
         }
-        for (; i < currentSize; i++) {
-            result[i] = {keys[i], values[i]};
-        }
-        return currentSize;
+        nearestEmptySlot = maxKey;
+    }
+   public:
+    OverflowKeyValue() {}
+
+    size_t getTotalCount() const { 
+        return maxSize; 
     }
 
-    int findKeyIndex(KeyType key) const {
+    bool hasEmptySlots() const {
+        return nearestEmptySlot < maxKey;
+    }   
+
+    size_t findKeyIndex(KeyType key) const {
         uint8_t key_low = key & 0xFF;
         uint8_t target_low = ((key_low * 251) % 255) + 1;
 
@@ -172,26 +261,48 @@ class OverflowKeyValue {
         __mmask64 mask_low = _mm512_cmpeq_epi8_mask(v_keys_low, v_target_low);
 
         while (mask_low) {
-            int candidate = __builtin_ctzll(mask_low);
+            size_t candidate = __builtin_ctzll(mask_low);
             mask_low &= mask_low - 1;
-            if (keys[candidate] == key) return (candidate < currentSize) ? candidate : -1;
+            if (keys[candidate] == key && valid_flags[candidate]) return (candidate < maxSize) ? candidate : -1;
         }
-        return -1;
+        return maxKey;
+    }
+
+    void updateValueAt_unsafe(int index, ValueType value) {
+        values[index] = value;
     }
 
     void updateValueAt(int index, ValueType value) {
-        while (overVersion.load(memory_order_acquire) == 1) {
-        }
-        overVersion.store(1, memory_order_release);
         values[index] = value;
-        overVersion.store(0, memory_order_release);
+    }
+
+    bool deleteKey(KeyType key) {
+        size_t index = findKeyIndex(key);
+        if (index != maxKey) {
+            valid_flags[index] = 0;
+            validSize--;
+            nearestEmptySlot = index < nearestEmptySlot ? index : nearestEmptySlot;
+            return true;
+        }
+        return false;
+    }
+
+    bool deleteKey_unsafe(KeyType key) {
+        size_t index = findKeyIndex(key);
+        if (index != maxKey) {
+            valid_flags[index] = 0;
+            validSize--;
+            nearestEmptySlot = index < nearestEmptySlot ? index : nearestEmptySlot;
+            return true;
+        }
+        return false;
     }
 
     size_t scan_optimized(KeyType key_low_bound,
                           size_t max_count,
                           pair<KeyType, ValueType>* result,
                           bool need_filter = true) const {
-        if (max_count == 0 || result == nullptr || currentSize == 0) {
+        if (max_count == 0 || result == nullptr || maxSize == 0) {
             return 0;
         }
 
@@ -213,34 +324,45 @@ class OverflowKeyValue {
         return copyDataWithLimit(result, max_count);
     }
 
-    InsertResult insert(KeyType key, ValueType value, atomic<int>* vecPtr) {
-        while (overVersion.load(memory_order_acquire) == 1) {
+    InsertResult insert(KeyType key, ValueType value) {      
+        if (nearestEmptySlot >= maxKey) {
+            return {InsertStatus::FULL, -1};
         }
-        if (currentSize < maxKey) {
-            overVersion.store(1, memory_order_release);
-            if (vecPtr->load(memory_order_acquire) == 1 or
-                globalVersion.load(memory_order_acquire) == 1) {
-                overVersion.store(0, memory_order_release);
-                return {InsertStatus::SPLIT, 1};
-            }
-            keys[currentSize] = key;
-            uint8_t key_low = key & 0xFF;
-            keys_low[currentSize] = ((key_low * 251) % 255) + 1;
-            values[currentSize] = value;
-            currentSize++;
-            overVersion.store(0, memory_order_release);
-            return {InsertStatus::SUCCESS, 1};
+        keys[nearestEmptySlot] = key;
+        values[nearestEmptySlot] = value;
+        uint8_t key_low = key & 0xFF;
+        keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
+        valid_flags[nearestEmptySlot] = true;
+        validSize++;
+        if (nearestEmptySlot == maxSize) {
+            maxSize++;
         }
+        updateNearestEmptySlot();
+        return {InsertStatus::SUCCESS, -1};
+    }
 
-        return {InsertStatus::FULL, -1};
+    InsertResult insert_unsafe(KeyType key, ValueType value) {      
+        if (nearestEmptySlot >= maxKey) {
+            return {InsertStatus::FULL, -1};
+        }
+        
+        keys[nearestEmptySlot] = key;
+        values[nearestEmptySlot] = value;
+        uint8_t key_low = key & 0xFF;
+        keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
+        valid_flags[nearestEmptySlot] = true;
+        validSize++;
+        if (nearestEmptySlot == maxSize) {
+            maxSize++;
+        }
+        updateNearestEmptySlot();
+        return {InsertStatus::SUCCESS, -1};
     }
 
     vector<pair<KeyType, ValueType>> rangeSearch(KeyType start_key, KeyType end_key) const {
         vector<pair<KeyType, ValueType>> results;
-
         const size_t batch_size = 8;
-        size_t num_batches = (currentSize + batch_size - 1) / batch_size;
-
+        size_t num_batches = (maxSize + batch_size - 1) / batch_size;
         for (size_t batch = 0; batch < num_batches; batch++) {
             size_t base_idx = batch * batch_size;
 
@@ -256,7 +378,7 @@ class OverflowKeyValue {
                 int pos = __builtin_ctzll(mask_in_range);
                 size_t actual_idx = base_idx + pos;
 
-                if (actual_idx < currentSize) {
+                if (actual_idx < maxSize) {
                     results.push_back({keys[actual_idx], values[actual_idx]});
                 }
 
@@ -268,18 +390,20 @@ class OverflowKeyValue {
     }
 
     SearchResult<KeyType, ValueType> search(KeyType key) const {
-        int index = findKeyIndex(key);
-        if (index >= 0) {
+        size_t index = findKeyIndex(key);
+        if (index != maxKey) {
             return {SearchStatus::SUCCESS, values[index]};
         }
         return {SearchStatus::NOT_FOUND, std::numeric_limits<ValueType>::max()};
     }
 
-    size_t size() const { return currentSize; }
+    size_t size() const { 
+        return maxSize;
+    }
 
     vector<pair<KeyType, ValueType>> getEntries() const {
         vector<pair<KeyType, ValueType>> entries;
-        for (size_t i = 0; i < currentSize; i++) {
+        for (size_t i = 0; i < maxSize; i++) {
             entries.push_back({keys[i], values[i]});
         }
         return entries;
@@ -287,253 +411,93 @@ class OverflowKeyValue {
 
     std::unique_ptr<OverflowKeyValue<KeyType, ValueType>> clone() const {
         auto newObj = std::make_unique<OverflowKeyValue<KeyType, ValueType>>();
-        newObj->currentSize = currentSize;
-        for (size_t i = 0; i < currentSize; i++) {
+        newObj->maxSize = maxSize;
+        newObj->validSize = validSize;
+        newObj->nearestEmptySlot = nearestEmptySlot;
+        newObj->valid_flags = valid_flags;
+        
+        for (size_t i = 0; i < maxSize; i++) {
             newObj->keys[i] = keys[i];
             newObj->keys_low[i] = keys_low[i];
             newObj->values[i] = values[i];
         }
         return newObj;
     }
-};
 
-template <typename KeyType, typename ValueType>
-class InnerOverflowArray {
-   private:
-    size_t capacity;
-    thread_local static unique_ptr<pair<KeyType, ValueType>[]> temp_buffer;
-    thread_local static size_t temp_buffer_size;
-
-    void ensure_temp_buffer(size_t required_size) {
-        if (!temp_buffer || temp_buffer_size < required_size) {
-            temp_buffer_size = max(required_size, size_t(maxKey * overflowCapacity * 2));
-            temp_buffer = make_unique<pair<KeyType, ValueType>[]>(temp_buffer_size);
-        }
-    }
-
-   public:
-    array<unique_ptr<OverflowKeyValue<KeyType, ValueType>>, overflowCapacity> data;
-
-    struct KeyLocation {
-        int overflowIndex;
-        int keyIndex;
-        bool found;
-    };
-
-    InnerOverflowArray() : capacity(1) {
-        data[0] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
-    }
-
-    InnerOverflowArray(size_t initCapacity) : capacity(initCapacity) {
-        if (capacity == 0) {
-            capacity = 1;
-        }
-        for (size_t i = 0; i < capacity; i++) {
-            data[i] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
-        }
-    }
-
-    InnerOverflowArray(const InnerOverflowArray& other) = delete;
-    InnerOverflowArray& operator=(const InnerOverflowArray& other) = delete;
-
-    InnerOverflowArray(InnerOverflowArray&& other) noexcept : capacity(other.capacity) {
-        for (size_t i = 0; i < capacity; i++) {
-            data[i] = move(other.data[i]);
-        }
-        other.capacity = 0;
-    }
-
-    InnerOverflowArray& operator=(InnerOverflowArray&& other) noexcept {
-        if (this != &other) {
-            capacity = other.capacity;
-            for (size_t i = 0; i < capacity; i++) {
-                data[i] = move(other.data[i]);
-            }
-            other.capacity = 0;
-        }
-        return *this;
-    }
-
-    unique_ptr<InnerOverflowArray<KeyType, ValueType>> clone() const {
-        auto newArray = std::make_unique<InnerOverflowArray<KeyType, ValueType>>(capacity);
-        for (size_t i = 0; i < capacity; i++) {
-            newArray->data[i] = data[i]->clone();
-        }
-        return newArray;
-    }
-
-    KeyLocation findKeyLocation(KeyType key) const {
-        for (size_t i = 0; i < capacity; i++) {
-            int keyIndex = data[i]->findKeyIndex(key);
-            if (keyIndex >= 0) {
-                return {static_cast<int>(i), keyIndex, true};
+    size_t copyAllData(pair<KeyType, ValueType>* result) const {
+        size_t i = 0;
+        for (; i + 8 <= maxSize; i += 8) {
+            for (int j = 0; j < 8; j++) {
+                result[i + j] = {keys[i + j], values[i + j]};
             }
         }
-        return {-1, -1, false};
-    }
-
-    bool updateValue(KeyType key, ValueType value) {
-        KeyLocation location = findKeyLocation(key);
-        if (location.found) {
-            data[location.overflowIndex]->updateValueAt(location.keyIndex, value);
-            return true;
+        for (; i < maxSize; i++) {
+            result[i] = {keys[i], values[i]};
         }
-        return false;
-    }
-
-    size_t getTotalCount() const {
-        size_t total = 0;
-        for (size_t i = 0; i < capacity; i++) {
-            total += data[i]->getTotalCount();
-        }
-        return total;
-    }
-
-    size_t scan_optimized(KeyType key_low_bound,
-                          size_t max_count,
-                          pair<KeyType, ValueType>* result,
-                          bool need_filter = true) {
-        if (max_count == 0 || result == nullptr) {
-            return 0;
-        }
-
-        size_t collected = 0;
-        for (size_t i = 0; i < capacity && collected < max_count; i++) {
-            size_t box_collected = data[i]->scan_optimized(key_low_bound,
-                                                           max_count - collected,
-                                                           result + collected,
-                                                           true // need_filter = true
-            );
-            collected += box_collected;
-        }
-        return collected;
-    }
-
-    size_t scan(KeyType key_low_bound,
-                size_t max_count,
-                pair<KeyType, ValueType>* result,
-                bool need_filter = true) {
-        return scan_optimized(key_low_bound, max_count, result, need_filter);
-    }
-
-    InsertResult insert(KeyType key, ValueType value, atomic<int>* vecPtr) {
-        if (this == nullptr || reinterpret_cast<uintptr_t>(this) < 0x1000) {
-            cerr << "Critical error: Invalid InnerOverflowArray this pointer: " << this
-                 << " in thread " << this_thread::get_id() << endl;
-            return {InsertStatus::BOUND_ERROR, -1};
-        }
-
-        try {
-            if (capacity == 0 || !data[0]) {
-                cerr << "Warning: InnerOverflowArray capacity is 0 or data[0] is null" << endl;
-                capacity = 1;
-                data[0] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
-            }
-
-            bool updated = updateValue(key, value);
-            if (updated) {
-                return {InsertStatus::SUCCESS, 1};
-            }
-            InsertResult ret;
-            size_t box_size = data[capacity - 1]->size();
-            if (box_size < maxKey) {
-                return data[capacity - 1]->insert(key, value, vecPtr);
-            } else {
-                if (capacity >= overflowCapacity) {
-                    return {InsertStatus::FULL, -1};
-                } else {
-                    data[capacity] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
-                    InsertResult ret = data[capacity]->insert(key, value, vecPtr);
-                    capacity++;
-                    return ret;
-                }
-            }
-        } catch (const exception& e) {
-            cerr << "Exception in InnerOverflowArray::insert: " << e.what() << endl;
-            return {InsertStatus::BOUND_ERROR, -1};
-        } catch (...) {
-            cerr << "Unknown exception in InnerOverflowArray::insert" << endl;
-            return {InsertStatus::BOUND_ERROR, -1};
-        }
-    }
-
-    vector<pair<KeyType, ValueType>> rangeSearch(KeyType start_key, KeyType end_key) const {
-        vector<pair<KeyType, ValueType>> results;
-
-        for (size_t i = 0; i < capacity; i++) {
-            auto box_results = data[i]->rangeSearch(start_key, end_key);
-            results.insert(results.end(), box_results.begin(), box_results.end());
-        }
-
-        return results;
-    }
-
-    SearchResult<KeyType, ValueType> search(KeyType key) {
-        for (size_t i = 0; i < capacity; i++) {
-            SearchResult ret = data[i]->search(key);
-            if (ret.status == SearchStatus::SUCCESS) return ret;
-        }
-        return {SearchStatus::NOT_FOUND, std::numeric_limits<ValueType>::max()};
-    }
-
-    size_t size() const {
-        if (capacity == 1 && data[0].get()->size() == 0) {
-            return 0;
-        }
-        return capacity;
-    }
-
-    OverflowKeyValue<KeyType, ValueType>* get(size_t index) { return data[index].get(); }
-
-    vector<pair<KeyType, ValueType>> getEntries() const {
-        vector<pair<KeyType, ValueType>> entries;
-        for (int i = 0; i < capacity; i++) {
-            vector<pair<KeyType, ValueType>> be = data[i]->getEntries();
-            entries.insert(entries.end(), be.begin(), be.end());
-        }
-        return entries;
-    }
-
-    size_t scan_load(pair<KeyType, ValueType>* result, size_t max_count) const {
-        size_t collected = 0;
-        for (size_t i = 0; i < capacity && collected < max_count; i++) {
-            size_t box_collected = data[i]->scan_load(result + collected, max_count - collected);
-            collected += box_collected;
-        }
-        return collected;
+        return maxSize;
     }
 };
-
-template <typename KeyType, typename ValueType>
-thread_local unique_ptr<pair<KeyType, ValueType>[]>
-    InnerOverflowArray<KeyType, ValueType>::temp_buffer;
-
-template <typename KeyType, typename ValueType>
-thread_local size_t InnerOverflowArray<KeyType, ValueType>::temp_buffer_size = 0;
 
 template <typename KeyType, typename ValueType>
 class Box {
    private:
-    size_t currentSize = 0;
-    atomic<int> boxVersion{0};
+    size_t maxSize = 0;
+    size_t validSize = 0;
+    size_t nearestEmptySlot = 0;
+    bitset<maxKey> valid_flags;
+
+    mutable std::atomic<uint32_t> version_lock_{0};
+    static constexpr uint32_t WRITE_LOCK_BIT = 0x80000000;
+    static constexpr uint32_t VERSION_MASK   = 0x7FFFFFFF;
 
     alignas(64) array<KeyType, maxKey> keys;
     alignas(64) array<uint8_t, maxKey> keys_low;
     alignas(64) array<ValueType, maxKey> values;
 
-    unique_ptr<InnerOverflowArray<KeyType, ValueType>> sharedOverflow;
+    struct BoxSearchResult {
+        uint8_t isUpdate; // 0 for update, 1 for insert, 2 for full
+        size_t level;
+        size_t slot;
+    };
 
-    thread_local static unique_ptr<pair<KeyType, ValueType>[]> box_temp_buffer;
-    thread_local static size_t box_temp_buffer_size;
+    enum BoxInsertResult : uint8_t {
+        UPDATE = 0,
+        INSERT = 1,
+        FULL = 2
+    };
 
-    void ensure_box_temp_buffer(size_t required_size) const {
-        if (!box_temp_buffer || box_temp_buffer_size < required_size) {
-            box_temp_buffer_size = max(required_size, size_t(maxKey * 3));
-            box_temp_buffer = make_unique<pair<KeyType, ValueType>[]>(box_temp_buffer_size);
-        }
+    // for overflowbox
+    size_t capacity;
+    array<unique_ptr<OverflowKeyValue<KeyType, ValueType>>, overflowCapacity> data;
+
+    inline bool test_write_lock(uint32_t &version) const {
+        version = version_lock_.load(std::memory_order_acquire);
+        return (version & WRITE_LOCK_BIT) != 0;
+    }
+    
+    inline bool version_changed(uint32_t old_version) const {
+        uint32_t current = version_lock_.load(std::memory_order_acquire);
+        return old_version != current;
     }
 
-    int findKeyIndex(KeyType key) const {
+    inline bool try_acquire_write_lock() {
+        uint32_t expected = version_lock_.load(std::memory_order_acquire);
+        if (expected & WRITE_LOCK_BIT) {
+            return false;
+        }
+        uint32_t desired = expected | WRITE_LOCK_BIT;
+        return version_lock_.compare_exchange_strong(expected, desired,
+                                                    std::memory_order_acq_rel,
+                                                    std::memory_order_acquire);
+    }
+    
+    inline void release_write_lock() {
+        uint32_t current = version_lock_.load(std::memory_order_relaxed);
+        uint32_t new_version = current + 1 - WRITE_LOCK_BIT;
+        version_lock_.store(new_version, std::memory_order_release);
+    }
+
+    size_t findKeyIndex(KeyType key) const {
         uint8_t key_low = key & 0xFF;
         uint8_t target_low = ((key_low * 251) % 255) + 1;
 
@@ -542,11 +506,26 @@ class Box {
         __mmask64 mask_low = _mm512_cmpeq_epi8_mask(v_keys_low, v_target_low);
 
         while (mask_low) {
-            int candidate = __builtin_ctzll(mask_low);
+            size_t candidate = __builtin_ctzll(mask_low);
             mask_low &= mask_low - 1;
-            if (keys[candidate] == key) return (candidate < currentSize) ? candidate : -1;
+            if (keys[candidate] == key && valid_flags[candidate]) return (candidate < maxSize) ? candidate : -1;
         }
-        return -1;
+        return maxKey;
+    }
+
+    void updateNearestEmptySlot() {  
+        for (size_t i = nearestEmptySlot; i < maxKey; i++) {
+            if (!valid_flags[i]) {
+                nearestEmptySlot = i;
+                return;
+            }
+        }
+        
+        if (maxSize < maxKey) {
+            nearestEmptySlot = maxSize;
+        } else {
+            nearestEmptySlot = -1;
+        }
     }
 
     size_t avx512_filter_main_keys_optimized(KeyType key_low_bound,
@@ -568,69 +547,283 @@ class Box {
     }
 
     size_t copyMainKeysWithLimit(pair<KeyType, ValueType>* result, size_t max_count) const {
-        for (size_t i = 0; i < currentSize; i++) {
+        size_t to_copy = std::min(maxSize, max_count);
+        for (size_t i = 0; i < to_copy; i++) {
             result[i] = {keys[i], values[i]};
         }
-        return currentSize;
+        return to_copy;
+    }
+
+    BoxSearchResult findKeyOrSlot(KeyType key, ValueType value) {
+        size_t existingIndex = findKeyIndex(key);
+        if (existingIndex != maxKey) {
+            values[existingIndex] = value;
+            return {BoxInsertResult::UPDATE, 0, existingIndex};
+        }
+        
+        if (validSize < maxKey) {
+            for (size_t i = 0; i < capacity; i++) {
+                size_t existingIndex = data[i]->findKeyIndex(key);
+                if (existingIndex != maxKey) {
+                    data[i]->updateValueAt(existingIndex, value);
+                    return {BoxInsertResult::UPDATE, i+1, existingIndex};
+                }
+            }
+            keys[nearestEmptySlot] = key;
+            values[nearestEmptySlot] = value;
+            uint8_t key_low = key & 0xFF;
+            keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
+            valid_flags[nearestEmptySlot] = true;
+            validSize++;
+            if (nearestEmptySlot == maxSize) {
+                maxSize++;
+            }
+            updateNearestEmptySlot();
+            return {BoxInsertResult::INSERT, 0, nearestEmptySlot};
+        } else {
+            size_t insertBox = capacity;
+            for (int i = capacity-1; i >= 0; i--) {
+                size_t existingIndex = data[i]->findKeyIndex(key);
+                if (existingIndex != maxKey) {
+                    data[i]->updateValueAt(existingIndex, value);
+                    return {BoxInsertResult::UPDATE, static_cast<size_t>(i+1), existingIndex};
+                }
+                if (data[i]->hasEmptySlots()) {
+                    insertBox = i;
+                }
+            }
+            if (insertBox == capacity) {
+                if (capacity == overflowCapacity) {
+                    return {BoxInsertResult::FULL, 0, 0}; // No space left
+                }
+                data[capacity] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
+                data[capacity]->insert(key, value);
+                capacity++;
+                return {BoxInsertResult::INSERT, capacity, 0};
+            } else {
+                data[insertBox]->insert(key, value);
+                return {BoxInsertResult::INSERT, insertBox+1, 0};
+            }
+        }
+    }
+
+    BoxSearchResult findKeyOrSlot_unsafe(KeyType key, ValueType value) {
+        size_t existingIndex = findKeyIndex(key);
+        if (existingIndex != maxKey) {
+            values[existingIndex] = value;
+            return {BoxInsertResult::UPDATE, 0, existingIndex};
+        }
+        
+        if (validSize < maxKey) {
+            for (size_t i = 0; i < capacity; i++) {
+                size_t existingIndex = data[i]->findKeyIndex(key);
+                if (existingIndex != maxKey) {
+                    data[i]->updateValueAt_unsafe(existingIndex, value);
+                    return {BoxInsertResult::UPDATE, i+1, existingIndex};
+                }
+            }
+            keys[nearestEmptySlot] = key;
+            values[nearestEmptySlot] = value;
+            uint8_t key_low = key & 0xFF;
+            keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
+            valid_flags[nearestEmptySlot] = true;
+            validSize++;
+            if (nearestEmptySlot == maxSize) {
+                maxSize++;
+            }
+            updateNearestEmptySlot();
+            return {BoxInsertResult::INSERT, 0, nearestEmptySlot};
+        } else {
+            size_t insertBox = capacity;
+            for (int i = capacity-1; i >= 0; i--) {
+                size_t existingIndex = data[i]->findKeyIndex(key);
+                if (existingIndex != maxKey) {
+                    data[i]->updateValueAt_unsafe(existingIndex, value);
+                    return {BoxInsertResult::UPDATE, static_cast<size_t>(i+1), existingIndex};
+                }
+                if (data[i]->hasEmptySlots()) {
+                    insertBox = i;
+                }
+            }
+            if (insertBox == capacity) {
+                if (capacity == overflowCapacity) {
+                    return {BoxInsertResult::FULL, 0, 0};
+                }
+                data[capacity] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
+                data[capacity]->insert_unsafe(key, value);
+                capacity++;
+                return {BoxInsertResult::INSERT, capacity, 0};
+            } else {
+                data[insertBox]->insert_unsafe(key, value);
+                return {BoxInsertResult::INSERT, insertBox+1, 0};
+            }
+        }
     }
 
    public:
-    Box() : sharedOverflow(make_unique<InnerOverflowArray<KeyType, ValueType>>()) {}
+    Box() : capacity(1) {
+        data[0] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
+    }
 
     Box(const Box& other)
-        : values(other.values),
-          currentSize(other.currentSize),
-          keys(other.keys),
-          keys_low(other.keys_low) {
-        if (other.sharedOverflow) {
-            sharedOverflow = other.sharedOverflow->clone();
-        } else {
-            sharedOverflow = make_unique<InnerOverflowArray<KeyType, ValueType>>();
+        : maxSize(other.maxSize),
+          validSize(other.validSize),
+          keys_low(other.keys_low),
+          valid_flags(other.valid_flags),
+          nearestEmptySlot(other.nearestEmptySlot),
+          capacity(other.capacity) {
+        while (true) {
+            uint32_t version_start;
+            if (other.test_write_lock(version_start)) {
+                std::this_thread::yield();
+                continue;
+            }
+            keys = other.keys;
+            keys_low = other.keys_low;
+            values = other.values;
+            if (!other.version_changed(version_start)) {
+                break;
+            }
+        }
+        for (size_t i = 0; i < capacity; i++) {
+            if (other.data[i]) {
+                data[i] = other.data[i]->clone();
+            }
         }
     }
 
     Box& operator=(const Box& other) {
         if (this != &other) {
-            values = other.values;
-            currentSize = other.currentSize;
-            keys = other.keys;
-            keys_low = other.keys_low;
-            if (other.sharedOverflow) {
-                sharedOverflow = other.sharedOverflow->clone();
-            } else {
-                sharedOverflow.reset();
+            while (!try_acquire_write_lock()) {
+                std::this_thread::yield();
             }
+            while (true) {
+                uint32_t version_start;
+                if (other.test_write_lock(version_start)) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                maxSize = other.maxSize;
+                validSize = other.validSize;
+                nearestEmptySlot = other.nearestEmptySlot;
+                valid_flags = other.valid_flags;
+                capacity = other.capacity;
+                keys = other.keys;
+                keys_low = other.keys_low;
+                values = other.values;
+                if (!other.version_changed(version_start)) {
+                    break;
+                }
+            }
+            for (size_t i = 0; i < capacity; i++) {
+                if (other.data[i]) {
+                    data[i] = other.data[i]->clone();
+                }
+            }
+            release_write_lock();
         }
         return *this;
     }
 
-    Box(Box&& other) noexcept = default;
-    Box& operator=(Box&& other) noexcept = default;
+    Box(Box&& other) noexcept 
+        : maxSize(other.maxSize),
+        validSize(other.validSize),
+        nearestEmptySlot(other.nearestEmptySlot),
+        valid_flags(other.valid_flags),
+        capacity(other.capacity),
+        keys(std::move(other.keys)),
+        keys_low(std::move(other.keys_low)),
+        values(std::move(other.values)) {
+        
+        version_lock_.store(other.version_lock_.load(std::memory_order_relaxed), 
+                        std::memory_order_relaxed);
+        
+        for (size_t i = 0; i < capacity; i++) {
+            data[i] = std::move(other.data[i]);
+        }
+    }
+
+    Box& operator=(Box&& other) noexcept {
+        if (this != &other) {
+            while (!try_acquire_write_lock()) {
+                std::this_thread::yield();
+            }
+            
+            maxSize = other.maxSize;
+            validSize = other.validSize;
+            nearestEmptySlot = other.nearestEmptySlot;
+            valid_flags = other.valid_flags;
+            capacity = other.capacity;
+            keys = std::move(other.keys);
+            keys_low = std::move(other.keys_low);
+            values = std::move(other.values);
+            
+            for (size_t i = 0; i < capacity; i++) {
+                data[i] = std::move(other.data[i]);
+            }
+            
+            release_write_lock();
+        }
+        return *this;
+    }
     ~Box() = default;
 
+    bool hasEmptySlots() const {
+        while (true) {
+            uint32_t version_start;
+            if (test_write_lock(version_start)) {
+                std::this_thread::yield();
+                continue;
+            }
+            bool result = nearestEmptySlot < maxKey;
+            if (!version_changed(version_start)) {
+                return result;
+            }
+        }
+    }
+
     size_t getTotalCount() const {
-        size_t total = currentSize;
-        if (sharedOverflow) {
-            total += sharedOverflow->getTotalCount();
+        size_t total = 0;
+        while (true) {
+            uint32_t version_start;
+            if (test_write_lock(version_start)) {
+                std::this_thread::yield();
+                continue;
+            }
+            total = maxSize;
+            if (!version_changed(version_start)) {
+                break;
+            }
+        }
+        for (size_t i = 0; i < capacity; i++) {
+            total += data[i]->getTotalCount();
         }
         return total;
     }
 
     size_t scan_optimized(KeyType key_low_bound,
-                          size_t max_count,
-                          pair<KeyType, ValueType>* result) const {
+                        size_t max_count,
+                        pair<KeyType, ValueType>* result,
+                        bool need_filter = true) const {
         if (max_count == 0 || result == nullptr) {
             return 0;
         }
 
         size_t collected = 0;
-        collected = avx512_filter_main_keys_optimized(key_low_bound, result, max_count);
-
-        if (sharedOverflow && collected < max_count) {
-            collected += sharedOverflow->scan_optimized(key_low_bound,
-                                                        max_count - collected,
-                                                        result + collected,
-                                                        true);
+        if (!need_filter) {
+            collected = copyMainKeysWithLimit(result, max_count);
+        } else {
+            collected = avx512_filter_main_keys_optimized(key_low_bound, result, max_count);
+        }
+        if (collected < max_count) {
+            for (size_t i = 0; i < capacity && collected < max_count; i++) {
+                size_t box_collected = data[i]->scan_optimized(key_low_bound,
+                                                                max_count - collected,
+                                                                result + collected,
+                                                                true // need_filter = true
+                );
+                collected += box_collected;
+            }
         }
         return collected;
     }
@@ -642,159 +835,187 @@ class Box {
         return scan_optimized(key_low_bound, max_count, result, need_filter);
     }
 
-    InsertResult insertKeyValue(KeyType key, ValueType value, atomic<int>* vecPtr) {
-        while (boxVersion.load(memory_order_acquire) == 1) {
+    DeleteResult deleteKey(KeyType key) {
+        if (!try_acquire_write_lock()) {
+            return {DeleteStatus::SPLIT, false};
         }
-        boxVersion.store(1, memory_order_release);
-
-        try {
-            int existingIndex = findKeyIndex(key);
-            if (existingIndex >= 0) {
-                if (vecPtr->load(memory_order_acquire) == 1 ||
-                    globalVersion.load(memory_order_acquire) == 1) {
-                    boxVersion.store(0, memory_order_release);
-                    return {InsertStatus::SPLIT, 1};
-                }
-                values[existingIndex] = value;
-                boxVersion.store(0, memory_order_release);
-                return {InsertStatus::SUCCESS, 1};
-            }
-
-            if (currentSize < maxKey) {
-                if (vecPtr->load(memory_order_acquire) == 1 ||
-                    globalVersion.load(memory_order_acquire) == 1) {
-                    boxVersion.store(0, memory_order_release);
-                    return {InsertStatus::SPLIT, 1};
-                }
-                keys[currentSize] = key;
-                uint8_t key_low = key & 0xFF;
-                keys_low[currentSize] = ((key_low * 251) % 255) + 1;
-                values[currentSize] = value;
-                currentSize++;
-                boxVersion.store(0, memory_order_release);
-                return {InsertStatus::SUCCESS, 1};
-            }
-
-            if (!sharedOverflow) {
-                sharedOverflow = make_unique<InnerOverflowArray<KeyType, ValueType>>();
-            }
-            if (!sharedOverflow || reinterpret_cast<uintptr_t>(sharedOverflow.get()) < 0x1000) {
-                cerr << "Warning: Invalid sharedOverflow pointer detected in thread "
-                     << this_thread::get_id() << endl;
-
-                sharedOverflow = make_unique<InnerOverflowArray<KeyType, ValueType>>();
-            }
-
-            InsertResult ret = sharedOverflow->insert(key, value, vecPtr);
-            boxVersion.store(0, memory_order_release);
-            return ret;
-        } catch (const exception& e) {
-            cerr << "Exception in insertKeyValue: " << e.what() << endl;
-            boxVersion.store(0, memory_order_release);
-            return {InsertStatus::BOUND_ERROR, -1};
-        } catch (...) {
-            cerr << "Unknown exception in insertKeyValue" << endl;
-            boxVersion.store(0, memory_order_release);
-            return {InsertStatus::BOUND_ERROR, -1};
+        size_t index = findKeyIndex(key);
+        if (index != maxKey) {
+            valid_flags[index] = 0;
+            validSize--;
+            nearestEmptySlot = index < nearestEmptySlot ? index : nearestEmptySlot;
+            release_write_lock();
+            return {DeleteStatus::SUCCESS, true};
         }
+        for (size_t i = 0; i < capacity; i++) {
+            if (data[i] && data[i]->deleteKey(key)) {
+                release_write_lock();
+                return {DeleteStatus::SUCCESS, true};
+            }
+        }
+        release_write_lock();
+        return {DeleteStatus::NOT_FOUND, false};
+    }
+
+    InsertResult insertKeyValue(KeyType key, ValueType value) { 
+        if (!try_acquire_write_lock()) {
+            return {InsertStatus::WRITING, -1};
+        }
+        BoxSearchResult ret = findKeyOrSlot(key, value); 
+        InsertStatus status;
+        if (ret.isUpdate == 0 || ret.isUpdate == 1) {
+            status = InsertStatus::SUCCESS;
+        } else {
+            status = InsertStatus::FULL;
+        }
+        
+        release_write_lock();
+        return {status, -1};
+    }
+
+    InsertResult insertKeyValue_unsafe(KeyType key, ValueType value) {
+        BoxSearchResult ret = findKeyOrSlot_unsafe(key, value);
+        InsertStatus status;
+        if (ret.isUpdate == BoxInsertResult::UPDATE || ret.isUpdate == BoxInsertResult::INSERT) {
+            status = InsertStatus::SUCCESS;
+        } else {
+            status = InsertStatus::FULL;
+        }
+        
+        return {status, -1};
     }
 
     vector<pair<KeyType, ValueType>> rangeSearch(KeyType start_key, KeyType end_key) const {
         vector<pair<KeyType, ValueType>> results;
+        {
+            const size_t batch_size = 8;
+            size_t num_batches = (maxSize + batch_size - 1) / batch_size;
 
-        const size_t batch_size = 8;
-        size_t num_batches = (currentSize + batch_size - 1) / batch_size;
+            for (size_t batch = 0; batch < num_batches; batch++) {
+                size_t base_idx = batch * batch_size;
 
-        for (size_t batch = 0; batch < num_batches; batch++) {
-            size_t base_idx = batch * batch_size;
+                __m512i v_keys = _mm512_load_si512(reinterpret_cast<const __m512i*>(&keys[base_idx]));
+                __m512i v_start = _mm512_set1_epi64(start_key);
+                __m512i v_end = _mm512_set1_epi64(end_key);
 
-            __m512i v_keys = _mm512_load_si512(reinterpret_cast<const __m512i*>(&keys[base_idx]));
-            __m512i v_start = _mm512_set1_epi64(start_key);
-            __m512i v_end = _mm512_set1_epi64(end_key);
+                __mmask8 mask_ge = _mm512_cmpge_epi64_mask(v_keys, v_start);
+                __mmask8 mask_le = _mm512_cmple_epi64_mask(v_keys, v_end);
+                __mmask8 mask_in_range = mask_ge & mask_le;
 
-            __mmask8 mask_ge = _mm512_cmpge_epi64_mask(v_keys, v_start);
-            __mmask8 mask_le = _mm512_cmple_epi64_mask(v_keys, v_end);
-            __mmask8 mask_in_range = mask_ge & mask_le;
+                while (mask_in_range) {
+                    int pos = __builtin_ctzll(mask_in_range);
+                    size_t actual_idx = base_idx + pos;
 
-            while (mask_in_range) {
-                int pos = __builtin_ctzll(mask_in_range);
-                size_t actual_idx = base_idx + pos;
+                    if (actual_idx < maxSize) {
+                        results.push_back({keys[actual_idx], values[actual_idx]});
+                    }
 
-                if (actual_idx < currentSize) {
-                    results.push_back({keys[actual_idx], values[actual_idx]});
+                    mask_in_range &= mask_in_range - 1;
                 }
-
-                mask_in_range &= mask_in_range - 1;
             }
         }
 
-        if (sharedOverflow) {
-            auto overflow_results = sharedOverflow->rangeSearch(start_key, end_key);
-            results.insert(results.end(), overflow_results.begin(), overflow_results.end());
+        for (size_t i = 0; i < capacity; i++) {
+            auto box_results = data[i]->rangeSearch(start_key, end_key);
+            results.insert(results.end(), box_results.begin(), box_results.end());
         }
 
         return results;
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) const {
-        int index = findKeyIndex(key);
-        if (index >= 0) {
-            return {SearchStatus::SUCCESS, values[index]};
+        while (true) {
+            uint32_t version_start;
+            if (test_write_lock(version_start)) {
+                std::this_thread::yield();
+                continue;
+            }            
+            size_t index = findKeyIndex(key);
+            if (index != maxKey) {
+                ValueType result_value = values[index];
+                
+                if (!version_changed(version_start)) {
+                    return {SearchStatus::SUCCESS, result_value};
+                }
+                continue;
+            }            
+            if (version_changed(version_start)) {
+                continue;
+            }            
+            for (size_t i = 0; i < capacity; i++) {
+                SearchResult<KeyType, ValueType> ret = data[i]->search(key);
+                if (ret.status == SearchStatus::SUCCESS) {
+                    if (!version_changed(version_start)) {
+                        return ret;
+                    }
+                    break;
+                }
+            }
+            if (!version_changed(version_start)) {
+                return {SearchStatus::NOT_FOUND, std::numeric_limits<ValueType>::max()};
+            }            
         }
-
-        if (sharedOverflow) {
-            return sharedOverflow->search(key);
-        }
-
-        return {SearchStatus::NOT_FOUND, std::numeric_limits<ValueType>::max()};
     }
 
-    size_t getCurrentSize() const { return currentSize; }
+    size_t getmaxSize() const { 
+        return maxSize; 
+    }
 
     vector<pair<KeyType, ValueType>> getEntries() const {
         vector<pair<KeyType, ValueType>> entries;
-        for (size_t i = 0; i < currentSize; i++) {
-            entries.push_back({keys[i], values[i]});
+        {
+            for (size_t i = 0; i < maxSize; i++) {
+                entries.push_back({keys[i], values[i]});
+            }
         }
-        vector<pair<KeyType, ValueType>> entry = sharedOverflow->getEntries();
-        entries.insert(entries.end(), entry.begin(), entry.end());
+        for (int i = 0; i < capacity; i++) {
+            vector<pair<KeyType, ValueType>> be = data[i]->getEntries();
+            entries.insert(entries.end(), be.begin(), be.end());
+        }
         return entries;
     }
 
     size_t scan_load(pair<KeyType, ValueType>* result, size_t max_count) const {
-        size_t collected = copyMainKeysWithLimit(result, max_count);
-
-        if (sharedOverflow) {
-            collected += sharedOverflow->scan_load(result + collected, max_count - collected);
+        size_t collected = 0;
+        collected = copyMainKeysWithLimit(result, max_count);
+        for (size_t i = 0; i < capacity && collected < max_count; i++) {
+            size_t box_collected = data[i]->scan_load(result + collected, max_count - collected);
+            collected += box_collected;
         }
 
         return collected;
     }
 
-    size_t getOverflowBoxCount() const { return sharedOverflow->size(); }
+    size_t getOverflowBoxCount() const {
+        size_t cap;
+        size_t first_overflow_size;
+        cap = capacity;
+        if (cap == 1) {
+            first_overflow_size = data[0]->size();
+            if (first_overflow_size == 0) {
+                return 0;
+            }
+        }
+        return cap;
+    }
 };
 
 template <typename KeyType, typename ValueType>
-thread_local unique_ptr<pair<KeyType, ValueType>[]> Box<KeyType, ValueType>::box_temp_buffer;
-
-template <typename KeyType, typename ValueType>
-thread_local size_t Box<KeyType, ValueType>::box_temp_buffer_size = 0;
-
-template <typename KeyType, typename ValueType>
 class Segment {
-   private:
+private:
     KeyType lower_bound;
     KeyType upper_bound;
     size_t box_key_range;
     int numBoxes;
 
-   public:
+    mutable OpenMPThreadLocalCounter modification_counter_;
+    mutable std::atomic<bool> splitting_{false};
+public:
     std::vector<Box<KeyType, ValueType>> boxes;
-    atomic<int> version{0};
-    atomic<int> versionForBox{0};
 
-    Segment(KeyType lower, KeyType upper, size_t box_range)
-        : lower_bound(lower), upper_bound(upper), box_key_range(box_range) {
+    Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
+        : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
+          modification_counter_(thread_num) {
         size_t total = upper - lower + 1;
         size_t box_count = total / box_range;
         if (total % box_range != 0) box_count++;
@@ -810,9 +1031,10 @@ class Segment {
           upper_bound(other.upper_bound),
           box_key_range(other.box_key_range),
           numBoxes(other.numBoxes),
-          boxes(std::move(other.boxes)),
-          version(other.version.load()),
-          versionForBox(other.versionForBox.load()) {}
+          modification_counter_(std::move(other.modification_counter_)),
+          boxes(std::move(other.boxes)) {
+        splitting_.store(other.splitting_.load());
+    }
 
     Segment& operator=(Segment&& other) noexcept {
         if (this != &other) {
@@ -820,41 +1042,117 @@ class Segment {
             upper_bound = other.upper_bound;
             box_key_range = other.box_key_range;
             numBoxes = other.numBoxes;
+            modification_counter_ = std::move(other.modification_counter_);
             boxes = std::move(other.boxes);
-            version.store(other.version.load());
-            versionForBox.store(other.versionForBox.load());
+            splitting_.store(other.splitting_.load());
         }
         return *this;
     }
 
-    InsertResult insertKeyValue(KeyType key, ValueType value) {
-        while (version.load(memory_order_acquire) == 1) {
+    std::vector<uint32_t> get_modification_snapshot() const {
+        return modification_counter_.get_snapshot();
+    }
+    
+    bool modified_since_snapshot(const std::vector<uint32_t>& snapshot) const {
+        return modification_counter_.changed_since_snapshot(snapshot);
+    }
+    
+    void increment_modification_count() {
+        modification_counter_.increment();
+    }
+    
+    uint64_t get_total_modifications() const {
+        return modification_counter_.get_total_count();
+    }
+
+    bool is_splitting() const {
+        return splitting_.load(std::memory_order_acquire);
+    }
+
+    void set_splitting(bool splitting) {
+        splitting_.store(splitting, std::memory_order_release);
+    }
+
+    InsertResult insertKeyValue(KeyType key, ValueType value, bool unsafe_mode = false) {
+        if (!unsafe_mode && is_splitting()) {
+            return {InsertStatus::SPLIT, -1};
         }
         size_t box_index = (key - lower_bound) / box_key_range;
-        InsertResult ret = boxes[box_index].insertKeyValue(key, value, &versionForBox);
+        if (box_index >= boxes.size()) {
+            if (unsafe_mode) {
+                static std::mutex boxes_expansion_mutex;
+                std::lock_guard<std::mutex> lock(boxes_expansion_mutex);
+                while (box_index >= boxes.size()) {
+                    boxes.emplace_back();
+                }
+            } else {
+                return {InsertStatus::FULL, static_cast<int>(box_index)};
+            }
+        }
+        
+        InsertResult ret;
+        if (unsafe_mode) {
+            ret = boxes[box_index].insertKeyValue_unsafe(key, value);
+        } else {
+            ret = boxes[box_index].insertKeyValue(key, value);
+            if (ret.status == InsertStatus::WRITING) {
+                return insertKeyValue(key, value, false);
+            }
+        }
         if (ret.status == InsertStatus::FULL) {
-            ret.box_index = box_index;
+            ret.box_index = static_cast<int>(box_index);
+        }
+        if (!unsafe_mode && ret.status == InsertStatus::SUCCESS) {
+            increment_modification_count();
         }
         return ret;
     }
 
+    DeleteResult deleteKey(KeyType key) {
+        if (is_splitting()) {
+            return {DeleteStatus::SPLIT, false};
+        }
+        size_t box_index = (key - lower_bound) / box_key_range;
+        if (box_index >= boxes.size()) {
+            return {DeleteStatus::ERROR, false};
+        }
+        DeleteResult result = boxes[box_index].deleteKey(key);
+        if (result.status == DeleteStatus::SUCCESS) {
+            increment_modification_count();
+        }
+        return result;
+    }
+
+    SearchResult<KeyType, ValueType> searchKey(KeyType key) const {
+        if (is_splitting()) {
+            return {SearchStatus::SPLIT, std::numeric_limits<ValueType>::max()};
+        }
+        size_t box_index = (key - lower_bound) / box_key_range;
+        if (box_index >= boxes.size()) {
+            return {SearchStatus::NOT_FOUND, std::numeric_limits<ValueType>::max()};
+        }
+        return boxes[box_index].searchKey(key);
+    }
+
     vector<pair<KeyType, ValueType>> rangeSearch(KeyType start_key, KeyType end_key) const {
+        if (is_splitting()) {
+            return {};
+        }
         vector<pair<KeyType, ValueType>> all_results;
         size_t start_box = 0;
         size_t end_box = boxes.size() - 1;
-
+        
         if (start_key > lower_bound) {
             start_box = (start_key - lower_bound) / box_key_range;
         }
         if (end_key < upper_bound) {
             end_box = min(end_box, (end_key - lower_bound) / box_key_range);
         }
-
+        
         for (size_t i = start_box; i <= end_box && i < boxes.size(); i++) {
             auto box_results = boxes[i].rangeSearch(start_key, end_key);
             all_results.insert(all_results.end(), box_results.begin(), box_results.end());
         }
-
         return all_results;
     }
 
@@ -862,10 +1160,10 @@ class Segment {
                           size_t max_count,
                           pair<KeyType, ValueType>* result,
                           bool need_filter = true) const {
-        if (max_count == 0 || result == nullptr || boxes.empty()) {
+        if (is_splitting() || max_count == 0 || result == nullptr || boxes.empty()) {
             return 0;
         }
-
+        
         size_t start_box_idx = 0;
         if (key_low_bound > lower_bound) {
             start_box_idx = (key_low_bound - lower_bound) / box_key_range;
@@ -873,23 +1171,19 @@ class Segment {
                 return 0;
             }
         }
-
+        
         size_t collected = 0;
-
-        for (size_t box_idx = start_box_idx; box_idx < boxes.size() && collected < max_count;
-             box_idx++) {
+        for (size_t box_idx = start_box_idx; box_idx < boxes.size() && collected < max_count; box_idx++) {
             size_t remaining = max_count - collected;
-
             bool box_need_filter = need_filter;
-
             KeyType box_lower = getBoxLower(box_idx);
+            
             if (key_low_bound <= box_lower) {
                 box_need_filter = false;
             }
-
+            
             if (!box_need_filter) {
                 size_t box_total = boxes[box_idx].getTotalCount();
-
                 if (box_total <= remaining) {
                     size_t box_collected = boxes[box_idx].scan_load(result + collected, remaining);
                     collected += box_collected;
@@ -905,7 +1199,6 @@ class Segment {
                                                                      remaining,
                                                                      result + collected);
                 collected += box_collected;
-
                 if (box_collected == 0) {
                     if (key_low_bound > getBoxUpper(box_idx)) {
                         continue;
@@ -915,7 +1208,6 @@ class Segment {
                 }
             }
         }
-
         return collected;
     }
 
@@ -926,21 +1218,49 @@ class Segment {
         return scan_optimized(key_low_bound, max_count, result, need_filter);
     }
 
-    SearchResult<KeyType, ValueType> searchKey(KeyType key) const {
-        size_t box_index = (key - lower_bound) / box_key_range;
-        return boxes[box_index].searchKey(key);
+    vector<pair<KeyType, ValueType>> prepare_for_split_stage1(int32_t box_index) {
+        int left_count = 3;
+        int right_count = 3;
+        int merge_start = std::max(0, box_index - left_count);
+        int merge_end = std::min(static_cast<int>(boxes.size()) - 1, box_index + right_count);
+        
+        vector<pair<KeyType, ValueType>> mergedEntries;
+        for (int i = merge_start; i <= merge_end; i++) {
+            auto entries = boxes[i].getEntries();
+            mergedEntries.insert(mergedEntries.end(), entries.begin(), entries.end());
+        }
+        
+        std::sort(mergedEntries.begin(), mergedEntries.end(),
+                 [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
+                     return a.first < b.first;
+                 });
+        return mergedEntries;
     }
 
-    vector<pair<KeyType, ValueType>> getAllEntries() const {
+    vector<pair<KeyType, ValueType>> getBoxRangeEntries(int start_box, int end_box) const {
         vector<pair<KeyType, ValueType>> entries;
-        for (const auto& box : boxes) {
-            vector<pair<KeyType, ValueType>> be = box.getEntries();
-            entries.insert(entries.end(), be.begin(), be.end());
+        int safe_start = std::max(0, start_box);
+        int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
+        for (int i = safe_start; i <= safe_end; i++) {
+            auto box_entries = boxes[i].getEntries();
+            entries.insert(entries.end(), box_entries.begin(), box_entries.end());
         }
         return entries;
     }
 
-    KeyType getBoxLower(int box_index) const { return lower_bound + box_index * box_key_range; }
+    vector<Box<KeyType, ValueType>> getPreservedBoxes(int start_box, int end_box) const {
+        vector<Box<KeyType, ValueType>> preserved;
+        int safe_start = std::max(0, start_box);
+        int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
+        for (int i = safe_start; i <= safe_end; i++) {
+            preserved.push_back(boxes[i]);
+        }
+        return preserved;
+    }
+
+    KeyType getBoxLower(int box_index) const { 
+        return lower_bound + box_index * box_key_range; 
+    }
 
     KeyType getBoxUpper(int box_index) const {
         KeyType candidate = lower_bound + (box_index + 1) * box_key_range;
@@ -951,11 +1271,20 @@ class Segment {
     KeyType getUpperBound() const { return upper_bound; }
     size_t getBoxKeyRange() const { return box_key_range; }
     size_t getBoxCount() const { return boxes.size(); }
+
+    vector<pair<KeyType, ValueType>> getAllEntries() const {
+        vector<pair<KeyType, ValueType>> entries;
+        for (const auto& box : boxes) {
+            vector<pair<KeyType, ValueType>> be = box.getEntries();
+            entries.insert(entries.end(), be.begin(), be.end());
+        }
+        return entries;
+    }
 };
 
 template <typename KeyType, typename ValueType>
 class LiBox {
-   private:
+private:
     double a;
     double b;
     vector<int32_t> redundantArray;
@@ -963,11 +1292,11 @@ class LiBox {
     vector<KeyType> segment_start_keys;
     int underflowThreshold;
     int overflowThreshold;
-
-    TaskQueue* splitTaskQueue;
     int thread_num;
 
-    vector<future<void>> currentBatchTasks;
+    mutable std::atomic<uint32_t> global_split_version_{0};
+    static constexpr uint32_t SPLIT_IN_PROGRESS = 0x80000000;
+    static constexpr uint32_t VERSION_MASK = 0x7FFFFFFF;
 
     struct BatchScanQuery {
         KeyType start_key;
@@ -975,21 +1304,50 @@ class LiBox {
         int original_index;
     };
 
-   public:
     struct RangeSearchResult {
         vector<pair<KeyType, ValueType>> results;
         size_t total_boxes_accessed;
         size_t total_keys_examined;
-
         RangeSearchResult() : total_boxes_accessed(0), total_keys_examined(0) {}
     };
 
-    LiBox() {}
+    bool is_global_splitting() const {
+        return (global_split_version_.load(std::memory_order_acquire) & SPLIT_IN_PROGRESS) != 0;
+    }
 
-    LiBox(int uThreshold, int oThreshold, TaskQueue* splitTaskQueue, int thread_num)
+    bool try_start_split() {
+        uint32_t expected = global_split_version_.load(std::memory_order_acquire);
+        while (expected & SPLIT_IN_PROGRESS) {
+            std::this_thread::yield();
+            expected = global_split_version_.load(std::memory_order_acquire);
+        }
+        
+        uint32_t desired = expected | SPLIT_IN_PROGRESS;
+        return global_split_version_.compare_exchange_strong(expected, desired,
+                                                            std::memory_order_acq_rel,
+                                                            std::memory_order_acquire);
+    }
+    
+    void finish_split() {
+        uint32_t current = global_split_version_.load(std::memory_order_relaxed);
+        uint32_t new_version = ((current + 1) & VERSION_MASK);
+        global_split_version_.store(new_version, std::memory_order_release);
+    }
+
+    void wait_for_operations_complete() {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    
+    bool validate_segments_consistency() const {
+        if (segment_start_keys.empty() || segments.empty()) {
+            return segment_start_keys.size() == segments.size();
+        }
+        return segment_start_keys.size() == segments.size() + 1;
+    }
+public:
+    LiBox(int uThreshold, int oThreshold, int thread_num)
         : underflowThreshold(uThreshold),
           overflowThreshold(oThreshold),
-          splitTaskQueue(splitTaskQueue),
           thread_num(thread_num) {}
 
     ~LiBox() {
@@ -997,69 +1355,106 @@ class LiBox {
         segment_start_keys.clear();
     }
 
-    void init(int uThreshold, int oThreshold, TaskQueue* taskQueue, int threadNum) {
+    void init(int uThreshold, int oThreshold, int threadNum) {
         underflowThreshold = uThreshold;
         overflowThreshold = oThreshold;
-        splitTaskQueue = taskQueue;
         thread_num = threadNum;
     }
 
-    void buildSearchIndex() {
-        int64_t redundantSize = segment_start_keys.size() * 90;
-        redundantArray.resize(redundantSize, -1);
-
-        a = static_cast<double>(redundantSize - 1) /
-            (segment_start_keys.back() - segment_start_keys.front());
-        b = -a * segment_start_keys.front();
-
-        for (size_t i = 0; i < segment_start_keys.size(); i++) {
-            int64_t position = static_cast<int64_t>(a * (segment_start_keys)[i] + b);
-            if (position >= 0 && position < redundantSize) {
-                redundantArray[position] = i;
-            }
+    InsertResult insertKeyValue(KeyType key, ValueType value) {
+        if (is_global_splitting()) {
+            std::this_thread::yield();
+            return insertKeyValue(key, value);
         }
-
-        int32_t lastValidIndex = 0;
-        for (size_t i = 0; i < redundantSize; i++) {
-            if (redundantArray[i] == -1) {
-                redundantArray[i] = lastValidIndex;
-            } else {
-                lastValidIndex = redundantArray[i];
-            }
+        int32_t num_index = searchIndex(key);
+        InsertResult ret = segments[num_index].insertKeyValue(key, value);
+        if (ret.status == InsertStatus::SUCCESS) {
+            return ret;
+        } else if (ret.status == InsertStatus::SPLIT) {
+            std::this_thread::yield();
+            return insertKeyValue(key, value);
+        } else if (ret.status == InsertStatus::FULL) {
+            int32_t box_index = ret.box_index;
+            splitSegment(num_index, box_index);
+            return insertKeyValue(key, value);;
+        } else {
+            return ret;
         }
     }
 
-    vector<int32_t> findCandidateSegments(KeyType start_key, KeyType end_key) {
-        vector<int32_t> candidates;
-        int32_t start_seg = searchIndex(start_key);
-        int32_t end_seg = searchIndex(end_key);
-        for (int32_t i = start_seg; i <= end_seg && i < static_cast<int32_t>(segments.size());
-             i++) {
-            KeyType seg_lower = segments[i].getLowerBound();
-            KeyType seg_upper = segments[i].getUpperBound();
-            if (!(seg_upper < start_key || seg_lower > end_key)) {
-                candidates.push_back(i);
-            }
+    DeleteResult deleteKey(KeyType key) {
+        if (is_global_splitting()) {
+            std::this_thread::yield();
+            return deleteKey(key);
         }
-        return candidates;
+        int32_t num_index = searchIndex(key);
+        if (num_index < 0 || num_index >= static_cast<int32_t>(segments.size())) {
+            return {DeleteStatus::ERROR, false};
+        }
+        DeleteResult ret = segments[num_index].deleteKey(key);
+        if (ret.status != DeleteStatus::SPLIT) {
+            return ret;
+        }
+        std::this_thread::yield();
+        return deleteKey(key);
+    }
+
+    SearchResult<KeyType, ValueType> searchKey(KeyType key) {
+        if (is_global_splitting()) {
+            std::this_thread::yield();
+            return searchKey(key);
+        }
+        int32_t num_index = searchIndex(key);
+        if (num_index < 0 || num_index >= static_cast<int32_t>(segments.size())) {
+            return {SearchStatus::ERROR, std::numeric_limits<ValueType>::max()};
+        }
+        SearchResult<KeyType, ValueType> ret = segments[num_index].searchKey(key);
+        if (ret.status != SearchStatus::SPLIT) {
+            return ret;
+        }
+        std::this_thread::yield();
+        return searchKey(key);
     }
 
     RangeSearchResult rangeSearch(KeyType start_key, KeyType end_key) {
         RangeSearchResult result;
-
         if (start_key > end_key) {
             return result;
         }
-        vector<int32_t> candidate_segments = findCandidateSegments(start_key, end_key);
-        vector<pair<KeyType, ValueType>> all_entries;
+        
+        const int MAX_RETRIES = 10;
+        int retry_count = 0;
+        
+        while (retry_count < MAX_RETRIES) {
+            if (is_global_splitting()) {
+                std::this_thread::yield();
+                retry_count++;
+                continue;
+            }
+            
+            vector<int32_t> candidate_segments = findCandidateSegments(start_key, end_key);
+            vector<pair<KeyType, ValueType>> all_entries;
+            bool need_retry = false;
 
-        for (int32_t seg_idx : candidate_segments) {
-            auto seg_results = segments[seg_idx].rangeSearch(start_key, end_key);
-            result.total_boxes_accessed += seg_results.size();
-            all_entries.insert(all_entries.end(), seg_results.begin(), seg_results.end());
+            for (int32_t seg_idx : candidate_segments) {
+                if (segments[seg_idx].is_splitting()) {
+                    need_retry = true;
+                    break;
+                }
+                auto seg_results = segments[seg_idx].rangeSearch(start_key, end_key);
+                result.total_boxes_accessed += seg_results.size();
+                all_entries.insert(all_entries.end(), seg_results.begin(), seg_results.end());
+            }
+            
+            if (!need_retry) {
+                result.total_keys_examined = all_entries.size();
+                result.results = move(all_entries);
+                return result;
+            }
+            
+            retry_count++;
+            std::this_thread::yield();
         }
-        result.total_keys_examined = all_entries.size();
-        result.results = move(all_entries);
         return result;
     }
 
@@ -1068,40 +1463,51 @@ class LiBox {
             return 0;
         }
 
-        int32_t start_segment_idx = searchIndex(key_low_bound);
-        if (start_segment_idx < 0) {
-            start_segment_idx = 0;
-        }
-
-        size_t collected = 0;
-
-        for (size_t seg_idx = start_segment_idx; seg_idx < segments.size() && collected < key_num;
-             seg_idx++) {
-            size_t remaining = key_num - collected;
-
-            bool need_filter = true;
-
-            if (key_low_bound <= segments[seg_idx].getLowerBound()) {
-                need_filter = false;
+        const int MAX_RETRIES = 10;
+        int retry_count = 0;
+        
+        while (retry_count < MAX_RETRIES) {
+            if (is_global_splitting()) {
+                std::this_thread::yield();
+                retry_count++;
+                continue;
             }
-
-            size_t seg_collected = segments[seg_idx].scan_optimized(key_low_bound,
-                                                                    remaining,
-                                                                    result + collected,
-                                                                    need_filter);
-
-            collected += seg_collected;
-
-            if (seg_collected == 0 && need_filter) {
-                if (key_low_bound > segments[seg_idx].getUpperBound()) {
-                    continue;
-                } else {
+            int32_t start_segment_idx = searchIndex(key_low_bound);
+            if (start_segment_idx < 0) {
+                start_segment_idx = 0;
+            }
+            size_t collected = 0;
+            bool need_retry = false;
+            for (size_t seg_idx = start_segment_idx; seg_idx < segments.size() && collected < key_num; seg_idx++) {
+                if (segments[seg_idx].is_splitting()) {
+                    need_retry = true;
                     break;
                 }
+                size_t remaining = key_num - collected;
+                bool need_filter = true;
+                if (key_low_bound <= segments[seg_idx].getLowerBound()) {
+                    need_filter = false;
+                }
+                size_t seg_collected = segments[seg_idx].scan_optimized(key_low_bound,
+                                                                        remaining,
+                                                                        result + collected,
+                                                                        need_filter);
+                collected += seg_collected;
+                if (seg_collected == 0 && need_filter) {
+                    if (key_low_bound > segments[seg_idx].getUpperBound()) {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
             }
+            if (!need_retry) {
+                return collected;
+            }
+            retry_count++;
+            std::this_thread::yield();
         }
-
-        return collected;
+        return 0;
     }
 
     size_t scan(KeyType key_low_bound, size_t key_num, pair<KeyType, ValueType>* result) {
@@ -1111,23 +1517,18 @@ class LiBox {
     void batch_scan_optimized(const vector<pair<KeyType, int>>& scan_queries,
                               vector<vector<pair<KeyType, ValueType>>>& results) {
         if (scan_queries.empty()) return;
-
         vector<BatchScanQuery> batch_queries;
         batch_queries.reserve(scan_queries.size());
-
         for (size_t i = 0; i < scan_queries.size(); i++) {
             batch_queries.push_back(
                 {scan_queries[i].first, scan_queries[i].second, static_cast<int>(i)});
         }
-
         sort(batch_queries.begin(),
              batch_queries.end(),
              [](const BatchScanQuery& a, const BatchScanQuery& b) {
                  return a.start_key < b.start_key;
              });
-
         results.resize(scan_queries.size());
-
         for (const auto& query : batch_queries) {
             results[query.original_index].resize(query.scan_count);
             size_t actual_count = scan_optimized(query.start_key,
@@ -1137,11 +1538,134 @@ class LiBox {
         }
     }
 
+    void splitSegment(int32_t index, int32_t box_index) {
+        auto modification_snapshot = segments[index].get_modification_snapshot();
+        
+        vector<pair<KeyType, ValueType>> mergedEntries = 
+            segments[index].prepare_for_split_stage1(box_index);
+        
+        vector<Segment<KeyType, ValueType>> newSegments;
+        vector<KeyType> newSegmentStartKeys;
+        
+        int left_count = 3;
+        int right_count = 3;
+        size_t numBoxes = segments[index].boxes.size();
+        int merge_start = std::max(0, box_index - left_count);
+        int merge_end = std::min(static_cast<int>(numBoxes) - 1, box_index + right_count);
+        
+        if (merge_start > 0) {
+            KeyType left_lower = segments[index].getLowerBound();
+            KeyType left_upper = segments[index].getBoxUpper(merge_start - 1);
+            Segment<KeyType, ValueType> leftSegment(left_lower, left_upper, 
+                                                    segments[index].getBoxKeyRange(), thread_num);
+            leftSegment.boxes.clear();
+            leftSegment.boxes.reserve(merge_start);
+            for (int i = 0; i < merge_start; i++) {
+                leftSegment.boxes.push_back(std::move(segments[index].boxes[i]));
+            }
+            newSegments.push_back(std::move(leftSegment));
+            newSegmentStartKeys.push_back(left_lower);
+        }
+        
+        KeyType merged_lower = segments[index].getBoxLower(merge_start);
+        KeyType merged_upper = segments[index].getBoxUpper(merge_end);
+        vector<KeyType> keys;
+        keys.reserve(mergedEntries.size());
+        for (const auto& entry : mergedEntries) {
+            keys.push_back(entry.first);
+        }
+        
+        Segment<KeyType, ValueType> newSegment(merged_lower, merged_upper,
+                                               segments[index].getBoxKeyRange(), thread_num);
+        newSegments.push_back(std::move(newSegment));
+        newSegmentStartKeys.push_back(merged_lower);
+        
+        if (merge_end < static_cast<int>(numBoxes) - 1) {
+            KeyType right_lower = segments[index].getBoxLower(merge_end + 1);
+            KeyType right_upper = segments[index].getUpperBound();
+            Segment<KeyType, ValueType> rightSegment(right_lower, right_upper,
+                                                     segments[index].getBoxKeyRange(), thread_num);
+            rightSegment.boxes.clear();
+            int right_box_count = numBoxes - (merge_end + 1);
+            rightSegment.boxes.reserve(right_box_count);
+            for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
+                rightSegment.boxes.push_back(std::move(segments[index].boxes[i]));
+            }
+            newSegments.push_back(std::move(rightSegment));
+            newSegmentStartKeys.push_back(right_lower);
+        }
+        
+        segments.erase(segments.begin() + index);
+        segments.insert(segments.begin() + index,
+                       std::make_move_iterator(newSegments.begin()),
+                       std::make_move_iterator(newSegments.end()));
+        
+        segment_start_keys.erase(segment_start_keys.begin() + index);
+        segment_start_keys.insert(segment_start_keys.begin() + index,
+                                 newSegmentStartKeys.begin(),
+                                 newSegmentStartKeys.end());
+        
+        buildSearchIndex();
+
+        for (const auto& entry : mergedEntries) {
+            insertKeyValue(entry.first, entry.second);
+        }
+    }
+
+    void buildSearchIndex() {
+        if (segment_start_keys.empty()) return;
+        
+        int64_t redundantSize = segment_start_keys.size() * 90;
+        vector<int32_t> temp_redundantArray(redundantSize, -1);
+        
+        double temp_a = static_cast<double>(redundantSize - 1) /
+                    (segment_start_keys.back() - segment_start_keys.front());
+        double temp_b = -temp_a * segment_start_keys.front();
+
+        for (size_t i = 0; i < segment_start_keys.size(); i++) {
+            int64_t position = static_cast<int64_t>(temp_a * segment_start_keys[i] + temp_b);
+            if (position >= 0 && position < redundantSize) {
+                temp_redundantArray[position] = i;
+            }
+        }
+        
+        int32_t lastValidIndex = 0;
+        for (size_t i = 0; i < redundantSize; i++) {
+            if (temp_redundantArray[i] == -1) {
+                temp_redundantArray[i] = lastValidIndex;
+            } else {
+                lastValidIndex = temp_redundantArray[i];
+            }
+        }
+        
+        {
+            static std::mutex index_update_mutex;
+            std::lock_guard<std::mutex> lock(index_update_mutex);
+            redundantArray = std::move(temp_redundantArray);
+            a = temp_a;
+            b = temp_b;
+        }
+    }
+
+    vector<int32_t> findCandidateSegments(KeyType start_key, KeyType end_key) {
+        vector<int32_t> candidates;
+        int32_t start_seg = searchIndex(start_key);
+        int32_t end_seg = searchIndex(end_key);
+        for (int32_t i = start_seg; i <= end_seg && i < static_cast<int32_t>(segments.size()); i++) {
+            KeyType seg_lower = segments[i].getLowerBound();
+            KeyType seg_upper = segments[i].getUpperBound();
+            if (!(seg_upper < start_key || seg_lower > end_key)) {
+                candidates.push_back(i);
+            }
+        }
+        return candidates;
+    }
+
     int32_t searchIndex(KeyType key) {
         if (key <= segment_start_keys.front()) {
             return 0;
         } else if (key >= segment_start_keys.back()) {
-            return segments.size() - 1; // return the last segment;
+            return segments.size() - 1;
         }
         int64_t position = static_cast<int64_t>(a * key + b);
         int32_t estimatedIndex = redundantArray[position];
@@ -1248,7 +1772,7 @@ class LiBox {
                 box_range = stoul(token);
             }
 
-            segments.emplace_back(lower, upper, box_range);
+            segments.emplace_back(lower, upper, box_range, thread_num);
             segment_start_keys.push_back(lower);
         }
         if (!segments.empty()) segment_start_keys.push_back(segments.back().getUpperBound() + 1);
@@ -1271,207 +1795,47 @@ class LiBox {
                   << " keys \n";
     }
 
+    const char* insertStatusToString(InsertStatus status) {
+        switch (status) {
+            case InsertStatus::SUCCESS: return "SUCCESS";
+            case InsertStatus::FULL: return "FULL";
+            case InsertStatus::SPLIT: return "SPLIT";
+            case InsertStatus::WRITING: return "WRITING";
+            default: return "UNKNOWN";
+        }
+    }
+
     void buildIndex(vector<KeyType>* file_keys) {
         int keys_size = file_keys->size();
         int inserted = 0;
         omp_set_num_threads(thread_num);
-#pragma omp parallel for reduction(+ : inserted)
+        #pragma omp parallel for reduction(+ : inserted)
         for (int i = 0; i < keys_size; i++) {
             if (insertKeyValue((*file_keys)[i], 1).status == InsertStatus::SUCCESS) inserted++;
         }
         cout << "bulk loading finished, inserted " << inserted << " keys \n";
     }
 
-    InsertResult insertKeyValue(KeyType key, ValueType value) {
-        while (globalVersion.load(memory_order_acquire) == 1) {
-        }
-        int32_t num_index = searchIndex(key);
-        InsertResult ret = segments[num_index].insertKeyValue(key, value);
-        if (ret.status == InsertStatus::FULL) {
-            int32_t box_index = ret.box_index;
-            future<void> task_future = splitTaskQueue->pushTask(
-                [this, num_index, box_index, key, value]() {
-                    this->splitSegment(num_index, box_index);
-                    this->insertKeyValue(key, value);
-                });
-
-            currentBatchTasks.push_back(move(task_future));
-            ret.status = InsertStatus::SUCCESS;
-        }
-
-        if (ret.status == InsertStatus::SPLIT) {
-            future<void> task_future = splitTaskQueue->pushTask(
-                [this, key, value]() { this->insertKeyValue(key, value); });
-            currentBatchTasks.push_back(move(task_future));
-            ret.status = InsertStatus::SUCCESS;
-        }
-        return ret;
-    }
-
-    SearchResult<KeyType, ValueType> searchKey(KeyType key) {
-        int32_t num_index = searchIndex(key);
-        return segments[num_index].searchKey(key);
-    }
-
-    void splitSegment(int32_t index, int32_t box_index) {
-        std::cout << "am splitting segments now" << std::endl; // debug
-        vector<Segment<KeyType, ValueType>> newSegments;
-        vector<KeyType> newsegment_start_keys;
-        vector<pair<KeyType, ValueType>> mergedEntries;
-
-        // The first stage is dealing with the segment
-        {
-            segments[index].version.store(1, memory_order_release);
-            segments[index].versionForBox.store(1, memory_order_release);
-            // Custom number
-            int left_count = 3;
-            int right_count = 3;
-
-            size_t numBoxes = segments[index].boxes.size();
-            int merge_start = (box_index - left_count >= 0) ? box_index - left_count : 0;
-            int merge_end = (box_index + right_count < static_cast<int>(numBoxes))
-                                ? box_index + right_count
-                                : numBoxes - 1;
-            if (merge_start > 0) {
-                KeyType left_lower = segments[index].getLowerBound();
-                KeyType left_upper = segments[index].getBoxUpper(merge_start - 1);
-                Segment<KeyType, ValueType> leftSegment(left_lower,
-                                                        left_upper,
-                                                        segments[index].getBoxKeyRange());
-                leftSegment.boxes.clear();
-                for (int i = 0; i < merge_start; i++) {
-                    leftSegment.boxes.push_back(segments[index].boxes[i]);
-                }
-                newSegments.push_back(move(leftSegment));
-                newsegment_start_keys.push_back(leftSegment.getLowerBound());
-            }
-            KeyType merged_lower = segments[index].getBoxLower(merge_start);
-            KeyType merged_upper = segments[index].getBoxUpper(merge_end);
-            Segment<KeyType, ValueType> mergedSegment(merged_lower,
-                                                      merged_upper,
-                                                      segments[index].getBoxKeyRange());
-            mergedSegment.boxes.clear();
-
-            for (int i = merge_start; i <= merge_end; i++) {
-                auto entries = segments[index].boxes[i].getEntries();
-                mergedEntries.insert(mergedEntries.end(), entries.begin(), entries.end());
-            }
-
-            sort(mergedEntries.begin(),
-                 mergedEntries.end(),
-                 [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
-                     return a.first < b.first;
-                 });
-
-            vector<KeyType> keys;
-            keys.reserve(mergedEntries.size());
-            for (const auto& p : mergedEntries) {
-                keys.push_back(p.first);
-            }
-            int maxMergeCount = 15;
-            double underflowThreshold = 1;
-            double overflowThreshold = 0.05;
-            vector<seg::Segment<KeyType>> finalSegments =
-                calculateSegments(keys, underflowThreshold, overflowThreshold, maxMergeCount, merged_lower, merged_upper);
-            for (int i = 0; i < finalSegments.size(); i++) {
-                Segment<KeyType, ValueType> newSegment(finalSegments[i].start_key,
-                                                       finalSegments[i].end_key,
-                                                       finalSegments[i].window_size);
-                newSegments.push_back(move(newSegment));
-                newsegment_start_keys.push_back(newSegment.getLowerBound());
-            }
-
-            if (merge_end < static_cast<int>(numBoxes) - 1) {
-                KeyType right_lower = segments[index].getBoxLower(merge_end + 1);
-                KeyType right_upper = segments[index].getUpperBound();
-                Segment<KeyType, ValueType> rightSegment(right_lower,
-                                                         right_upper,
-                                                         segments[index].getBoxKeyRange());
-                rightSegment.boxes.clear();
-                for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
-                    rightSegment.boxes.push_back(segments[index].boxes[i]);
-                }
-                newSegments.push_back(move(rightSegment));
-                newsegment_start_keys.push_back(rightSegment.getLowerBound());
-            }
-
-            segments[index].versionForBox.store(0, memory_order_release);
-            segments[index].version.store(0, memory_order_release);
-        }
-
-        // The second stage, global update
-        {
-            globalVersion.store(1, memory_order_release);
-            segments.erase(segments.begin() + index);
-            segments.insert(segments.begin() + index,
-                            std::make_move_iterator(newSegments.begin()),
-                            std::make_move_iterator(newSegments.end()));
-            segment_start_keys.erase(segment_start_keys.begin() + index);
-            segment_start_keys.insert(segment_start_keys.begin() + index,
-                                      newsegment_start_keys.begin(),
-                                      newsegment_start_keys.end());
-            buildSearchIndex();
-            globalVersion.store(0, memory_order_release);
-        }
-
-        // The third stage is to reinsert the data
-        {
-            for (int i = 0; i < mergedEntries.size(); i++) {
-                KeyType key = mergedEntries[i].first;
-                ValueType value = mergedEntries[i].second;
-                splitTaskQueue->pushTask(
-                    [this, key, value]() { this->insertKeyValue(key, value); });
-            }
-        }
-    }
-
-    void waitForCurrentBatch() {
-        for (auto& future : currentBatchTasks) {
-            future.wait();
-        }
-        currentBatchTasks.clear();
-    }
-
     vector<KeyType> getSegmentStartKeys() { return segment_start_keys; }
 
-    // Get the index size in terms of bytes
     size_t get_index_size() const {
         size_t index_size = 0;
-
-        // Size of redundant array (search index)
         index_size += redundantArray.size() * sizeof(int32_t);
-
-        // Size of segment_start_keys
         index_size += segment_start_keys.size() * sizeof(KeyType);
-
-        // Size of segment metadata (not including actual key-value pairs)
         for (const auto& segment : segments) {
-            // Segment bounds and metadata
-            index_size += sizeof(KeyType) * 2;          // lower_bound and upper_bound
-            index_size += sizeof(size_t);               // box_key_range
-            index_size += sizeof(int);                  // numBoxes
-            index_size += sizeof(std::atomic<int>) * 2; // version and versionForBox
-
-            // Box metadata (not including the key-value pairs)
-            index_size += segment.getBoxCount() * sizeof(size_t); // currentSize for each box
-            index_size += segment.getBoxCount() *
-                          sizeof(std::atomic<int>); // boxVersion for each box
-            index_size +=
-                segment.getBoxCount() *
-                sizeof(std::unique_ptr<InnerOverflowArray<KeyType, ValueType>>); // sharedOverflow
-                                                                                 // for each box
+            index_size += sizeof(KeyType) * 2;
+            index_size += sizeof(size_t);
+            index_size += sizeof(int);
+            index_size += sizeof(std::atomic<int>) * 2;
+            index_size += segment.getBoxCount() * sizeof(size_t);
+            index_size += segment.getBoxCount() * sizeof(std::atomic<int>);
         }
-
         return index_size;
     }
 
-    // Get the total size in terms of bytes (index size + sizeof(key+value))
     size_t get_total_size() const {
-        // Start with the index size
         size_t size = get_index_size();
         std::cout << "index_size: " << size << std::endl;
-
-        // Add the size of actual key-value pairs and their associated structures
         size_t total_boxes_count = 0;
         size_t total_overflow_boxes_count = 0;
         for (const auto& segment : segments) {
@@ -1479,33 +1843,21 @@ class LiBox {
             for (const auto& box : segment.boxes) {
                 size_t overflow_count = box.getOverflowBoxCount();
                 total_overflow_boxes_count += overflow_count;
-                // Size of main box keys and values
-                size += maxKey * sizeof(KeyType);   // keys
-                size += maxKey * sizeof(uint8_t);   // keys_low
-                size += maxKey * sizeof(ValueType); // values
-
-                // Overhead for overflow structures
+                size += maxKey * sizeof(KeyType);
+                size += maxKey * sizeof(uint8_t);
+                size += maxKey * sizeof(ValueType);
                 if (overflow_count > 0) {
-                    size += sizeof(InnerOverflowArray<KeyType, ValueType>);
                     size += overflow_count * sizeof(OverflowKeyValue<KeyType, ValueType>);
                 }
-                /* if(overflow_count >= 2){
-                    std::cout << "[Debug] overflow box count: " << overflow_count << std::endl;
-                } */
             }
         }
 
-        // Debug: check how many boxes and overflow-boxes
         std::cout << "[Debug] total boxes count: " << total_boxes_count
                   << "; total overflow boxes count: " << total_overflow_boxes_count << std::endl;
         std::cout << "[Debug] Size of Box: " << sizeof(Box<KeyType, ValueType>) << std::endl;
-        std::cout << "[Debug] Size of InnerOverflow: "
-                  << sizeof(InnerOverflowArray<KeyType, ValueType>) << std::endl;
         std::cout << "[Debug] Size of Overflow: " << sizeof(OverflowKeyValue<KeyType, ValueType>)
                   << std::endl;
-        std::cout << "[Debug] Size of sharedOverflow: "
-                  << sizeof(std::unique_ptr<InnerOverflowArray<KeyType, ValueType>>) << std::endl;
         return size;
     }
 };
-} // namespace liboxns
+}

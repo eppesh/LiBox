@@ -5,7 +5,7 @@ TARGET = ./test/benchmark
 
 THREAD_MODE ?= 1
 
-COMMON_FLAGS = --std=c++17 -faligned-new -march=native -fopenmp 
+COMMON_FLAGS = --std=c++20 -faligned-new -march=native -fopenmp 
 
 all:
 	$(CXX) -O3 $(COMMON_FLAGS) -DNDEBUG $(SRC) -o $(TARGET)
@@ -16,8 +16,8 @@ debug:
 
 MAC_FLAGS ?= $(MAC_RELEASE_FLAGS)
 
-MAC_RELEASE_FLAGS = -std=c++17 -O3 -DNDEBUG
-MAC_DEBUG_FLAGS = -std=c++17 -g
+MAC_RELEASE_FLAGS = -std=c++20 -O3 -DNDEBUG
+MAC_DEBUG_FLAGS = -std=c++20 -g
 
 partition:
 	$(CXX) $(MAC_RELEASE_FLAGS) src/partition_optimization.cpp -o partition_optimization
