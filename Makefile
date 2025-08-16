@@ -5,7 +5,7 @@ TARGET = ./test/benchmark
 
 THREAD_MODE ?= 1
 
-COMMON_FLAGS = --std=c++17 -faligned-new -march=native -fopenmp 
+COMMON_FLAGS = --std=c++20 -faligned-new -march=native -fopenmp 
 
 all:
 	$(CXX) -O3 $(COMMON_FLAGS) -DNDEBUG $(SRC) -o $(TARGET)
@@ -16,8 +16,8 @@ debug:
 
 MAC_FLAGS ?= $(MAC_RELEASE_FLAGS)
 
-MAC_RELEASE_FLAGS = -std=c++17 -O3 -DNDEBUG
-MAC_DEBUG_FLAGS = -std=c++17 -g
+MAC_RELEASE_FLAGS = -std=c++20 -O3 -DNDEBUG
+MAC_DEBUG_FLAGS = -std=c++20 -g
 
 partition:
 	$(CXX) $(MAC_RELEASE_FLAGS) src/partition_optimization.cpp -o partition_optimization
@@ -41,3 +41,6 @@ segment_debug:
 
 clean:
 	rm -f $(TARGET) $(TARGET)_debug partition_optimization partition_optimization_debug ratio_by_win ratio_by_win_debug seg_len_by_win seg_len_by_win_debug segmentation segmentation_debug
+
+lock_benchmark:
+	$(CXX) -O2 -DNDEBUG src/lock_benchmark.cpp -o lock_benchmark

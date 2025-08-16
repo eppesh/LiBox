@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -20,6 +21,7 @@
 #include <queue>
 #include <random>
 #include <sstream>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -277,20 +279,7 @@ int main (int argc, char* argv[]) {
     }
     cout << "Read " << file_keys.size () << " numbers from file.\n";
 
-    TaskQueue splitTaskQueue;
-    vector<int> taskCoreIDs = {1,3,5,7};
-    vector<thread> taskPool;
-    for (size_t i = 0; i < taskCoreIDs.size(); i++) {
-        taskPool.emplace_back([&splitTaskQueue]() {
-            std::packaged_task<void()> task;
-            while (splitTaskQueue.popTask(task)) {
-                task();
-            }
-        });
-        setThreadAffinity(taskPool.back(), taskCoreIDs[i]);
-    }
-
-    liboxns::LiBox<KeyType, ValueType> index (init_underflow, init_overflow, &splitTaskQueue, thread_num);
+    liboxns::LiBox<KeyType, ValueType> index (init_underflow, init_overflow, thread_num);
     index.loadConfigByFile (config_file_path);
     vector<KeyType> init_keys (file_keys.begin (), file_keys.begin () + init_num_keys);
     index.buildIndex (&init_keys);
@@ -356,7 +345,6 @@ int main (int argc, char* argv[]) {
                 }
             }
             
-            index.waitForCurrentBatch();
             inserts_end_time = chrono::high_resolution_clock::now ();
 
             batch_insert_time =
@@ -590,7 +578,6 @@ int main (int argc, char* argv[]) {
                     }
                 }
                 
-                index.waitForCurrentBatch();
                 inserts_end_time = chrono::high_resolution_clock::now();
                 
                 batch_insert_time = chrono::duration_cast<chrono::nanoseconds>(inserts_end_time - inserts_start_time).count();
@@ -708,11 +695,6 @@ int main (int argc, char* argv[]) {
     if (cumulative_lookups > 0) {
         cout << "Found " << cumulative_found << " matches out of " << cumulative_lookups << " lookups ("
             << (static_cast<double> (cumulative_found) / cumulative_lookups * 100.0) << "%)" << endl;
-    }
-
-    splitTaskQueue.shutdown ();
-    for (auto& thr : taskPool) {
-        if (thr.joinable ()) thr.join ();
     }
 
     return 0;
