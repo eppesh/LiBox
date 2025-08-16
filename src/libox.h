@@ -874,8 +874,6 @@ public:
     }
 
     std::vector<std::pair<KeyType, ValueType>> rangeSearch(KeyType start_key, KeyType end_key) const {
-        segment_lock_.lock_shared();
-        
         std::vector<std::pair<KeyType, ValueType>> all_results;
         size_t start_box = 0;
         size_t end_box = boxes.size() - 1;
@@ -892,7 +890,6 @@ public:
             all_results.insert(all_results.end(), box_results.begin(), box_results.end());
         }
         
-        segment_lock_.unlock_shared();
         return all_results;
     }
 
@@ -900,9 +897,7 @@ public:
                           size_t max_count,
                           std::pair<KeyType, ValueType>* result,
                           bool need_filter = true) const {
-        segment_lock_.lock_shared();
         if (max_count == 0 || result == nullptr || boxes.empty()) {
-            segment_lock_.unlock_shared();
             return 0;
         }
 
@@ -910,7 +905,6 @@ public:
         if (key_low_bound > lower_bound) {
             start_box_idx = (key_low_bound - lower_bound) / box_key_range;
             if (start_box_idx >= boxes.size()) {
-                segment_lock_.unlock_shared();
                 return 0;
             }
         }
@@ -951,7 +945,6 @@ public:
                 }
             }
         }
-        segment_lock_.unlock_shared();
         return collected;
     }
 
@@ -984,7 +977,6 @@ public:
     }
 
     vector<pair<KeyType, ValueType>> getBoxRangeEntries(int start_box, int end_box) const {
-        segment_lock_.lock_shared();
         vector<pair<KeyType, ValueType>> entries;
         int safe_start = std::max(0, start_box);
         int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
@@ -992,19 +984,16 @@ public:
             auto box_entries = boxes[i].getEntries();
             entries.insert(entries.end(), box_entries.begin(), box_entries.end());
         }
-        segment_lock_.unlock_shared();
         return entries;
     }
 
     vector<Box<KeyType, ValueType>> getPreservedBoxes(int start_box, int end_box) const {
-        segment_lock_.lock_shared();
         vector<Box<KeyType, ValueType>> preserved;
         int safe_start = std::max(0, start_box);
         int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
         for (int i = safe_start; i <= safe_end; i++) {
             preserved.push_back(boxes[i]);
         }
-        segment_lock_.unlock_shared();
         return preserved;
     }
 
@@ -1085,20 +1074,16 @@ public:
     InsertResult insertKeyValue(KeyType key, ValueType value) {
         global_lock_.lock_shared();
         int32_t num_index = searchIndex(key);
-        segments[num_index].get_lock().lock_shared();
         InsertResult ret = segments[num_index].insertKeyValue(key, value);
         if (ret.status == InsertStatus::SUCCESS) {
-            segments[num_index].get_lock().unlock_shared();
             global_lock_.unlock_shared();
             return ret;
         } else if (ret.status == InsertStatus::FULL) {
             int32_t box_index = ret.box_index;
-            segments[num_index].get_lock().unlock_shared();
             global_lock_.unlock_shared();
             splitSegment(num_index, box_index);
             return insertKeyValue(key, value);
         } else {
-            segments[num_index].get_lock().unlock_shared();
             global_lock_.unlock_shared();
             return ret;
         }
@@ -1111,22 +1096,20 @@ public:
             global_lock_.unlock_shared();
             return {DeleteStatus::ERROR, false};
         }
-        segments[num_index].get_lock().lock_shared();
         DeleteResult ret = segments[num_index].deleteKey(key);
-        segments[num_index].get_lock().unlock_shared();
         global_lock_.unlock_shared();
         return ret;
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
-        // global_lock_.lock_shared();
+        global_lock_.lock_shared();
         int32_t num_index = searchIndex(key);
         if (num_index < 0 || num_index >= static_cast<int32_t>(segments.size())) {
             global_lock_.unlock_shared();
             return {SearchStatus::ERROR, std::numeric_limits<ValueType>::max()};
         }
         SearchResult<KeyType, ValueType> ret = segments[num_index].searchKey(key);
-        // global_lock_.unlock_shared();
+        global_lock_.unlock_shared();
         return ret;
     }
 

@@ -204,7 +204,7 @@ public:
         
         volatile int sum = 0;
         for (int i = 0; i < ITERATIONS; i++) {
-            if (i % 10 == 0) {
+            if (i % 2 == 0) {
                 optimistic_lock_.optimistic_write(i);
             } else {
                 sum += optimistic_lock_.optimistic_read();
