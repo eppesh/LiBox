@@ -4,60 +4,103 @@
 #include <thread>
 #include <iostream>
 #include <vector>
+#include <cstdlib>
 #include <atomic>
 #include <memory>
 #include <iomanip>
+#include <cstdint>
+
+class PartitionedCounter {
+private:
+    struct alignas(64) LocalCounter {
+        std::atomic<int64_t> counter{0};
+    };
+    
+    LocalCounter* local_counters;
+    int num_counters;
+
+public:
+    PartitionedCounter(int thread_num) : num_counters(thread_num) {
+        local_counters = new LocalCounter[num_counters];
+    }
+    
+    ~PartitionedCounter() {
+        delete[] local_counters;
+    }
+    
+    int64_t get() const {
+        int64_t total = 0;
+        for (int i = 0; i < num_counters; i++) {
+            total += local_counters[i].counter.load();
+        }
+        return total;
+    }
+    
+    void add(int64_t count, uint8_t counter_id) {
+        counter_id = counter_id % num_counters;
+        local_counters[counter_id].counter += count;
+    }
+};
 
 class ThreadLocalLock {
 private:
-    struct alignas(64) ThreadLockState {
-        std::atomic<int> shared_count{0};
-        std::atomic<bool> exclusive_held{false};
-        char padding[56];
-    };
-    
-    std::unique_ptr<ThreadLockState[]> thread_states_;
-    std::atomic<bool> global_exclusive_{false};
-    int thread_num_;
-    
-    int get_thread_slot() const {
-        return 0;
+    PartitionedCounter readers_;
+    std::atomic_flag writer_;
+    int num_counters;
+
+    int get_thread_partition() const {
+        return 0; // 单线程测试，总是返回0
     }
 
 public:
-    explicit ThreadLocalLock(int thread_num) : thread_num_(thread_num) {
-        thread_states_ = std::make_unique<ThreadLockState[]>(thread_num);
+    ThreadLocalLock(int thread_num) : readers_(thread_num), num_counters(thread_num) {
+        writer_.clear();
     }
     
     void lock_shared() {
-        int slot = get_thread_slot();
-        while (global_exclusive_.load(std::memory_order_acquire)) {
-        }
-        thread_states_[slot].shared_count.fetch_add(1, std::memory_order_acq_rel);
-        if (global_exclusive_.load(std::memory_order_acquire)) {
-            thread_states_[slot].shared_count.fetch_sub(1, std::memory_order_acq_rel);
-            lock_shared();
+        int partition = get_thread_partition();
+        readers_.add(1, partition);
+        
+        while (writer_.test(std::memory_order_acquire)) {
+            readers_.add(-1, partition);
+            writer_.wait(true, std::memory_order_acquire);
+            readers_.add(1, partition);
         }
     }
     
     void unlock_shared() {
-        int slot = get_thread_slot();
-        thread_states_[slot].shared_count.fetch_sub(1, std::memory_order_acq_rel);
+        int partition = get_thread_partition();
+        readers_.add(-1, partition);
     }
     
     void lock() {
-        bool expected = false;
-        while (!global_exclusive_.compare_exchange_weak(expected, true, std::memory_order_acq_rel)) {
-            expected = false;
+        while (writer_.test_and_set(std::memory_order_acq_rel)) {
+            writer_.wait(true, std::memory_order_acq_rel);
         }
-        for (int i = 0; i < thread_num_; i++) {
-            while (thread_states_[i].shared_count.load(std::memory_order_acquire) > 0) {
-            }
+        
+        while (readers_.get() > 0) {
         }
     }
     
     void unlock() {
-        global_exclusive_.store(false, std::memory_order_release);
+        writer_.clear(std::memory_order_release);
+        writer_.notify_all();
+    }
+    
+    bool try_upgrade() {
+        int partition = get_thread_partition();
+        
+        if (writer_.test_and_set(std::memory_order_acq_rel)) {
+            readers_.add(-1, partition);
+            return false;
+        }
+        
+        readers_.add(-1, partition);
+        
+        while (readers_.get() > 0) {
+        }
+        
+        return true;
     }
 };
 
@@ -66,20 +109,39 @@ private:
     mutable std::atomic<uint32_t> version_lock_{0};
     static constexpr uint32_t WRITE_LOCK_BIT = 0x80000000;
     static constexpr uint32_t VERSION_MASK   = 0x7FFFFFFF;
-    
+    mutable std::atomic<bool> segment_splitting_{false};
+
+    mutable std::atomic<uint32_t> global_split_version_{0};
+    static constexpr uint32_t SPLIT_IN_PROGRESS = 0x80000000;
+
     volatile int data_value_ = 42;
 
 public:
     OptimisticLock() = default;
     
+    bool is_segment_splitting() const {
+        return segment_splitting_.load(std::memory_order_acquire);
+    }
+
+    bool is_global_splitting() const {
+        return (global_split_version_.load(std::memory_order_acquire) & SPLIT_IN_PROGRESS) != 0;
+    }
+
     int optimistic_read() const {
         while (true) {
             uint32_t version_start;
+            if (is_global_splitting()) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (is_segment_splitting()) {
+                std::this_thread::yield();
+                continue;
+            }
             if (test_write_lock(version_start)) {
                 std::this_thread::yield();
                 continue;
             }
-            
             int result = data_value_;
             
             if (!version_changed(version_start)) {
@@ -89,6 +151,14 @@ public:
     }
     
     void optimistic_write(int new_value) {
+        if (is_global_splitting()) {
+            std::this_thread::yield();
+            std::abort();
+        }
+        if (is_segment_splitting()) {
+            std::this_thread::yield();
+            std::abort();
+        }
         if (!try_acquire_write_lock()) {
             std::this_thread::yield();
             return optimistic_write(new_value);
@@ -135,6 +205,8 @@ private:
     ThreadLocalLock segment_lock_;
     std::shared_mutex box_lock_;
     OptimisticLock optimistic_lock_;
+
+    mutable std::atomic<uint32_t> global_split_version_{0};
     
     volatile int dummy_data_ = 0;
     
@@ -225,6 +297,7 @@ public:
             std::shared_lock<std::shared_mutex> lock(box_lock_);
             
             sum += simple_read_operation();
+            libox_lock_.unlock_shared();
         }
         
         auto end = std::chrono::high_resolution_clock::now();
@@ -241,6 +314,9 @@ public:
             std::unique_lock<std::shared_mutex> lock(box_lock_);
             
             simple_operation();
+
+            segment_lock_.unlock_shared();
+            libox_lock_.unlock_shared();
         }
         
         auto end = std::chrono::high_resolution_clock::now();
@@ -258,12 +334,15 @@ public:
                 std::shared_lock<std::shared_mutex> lock(box_lock_);
                 
                 sum += simple_read_operation();
+                libox_lock_.unlock_shared();
             } else {
                 libox_lock_.lock_shared();
                 segment_lock_.lock_shared();
                 std::unique_lock<std::shared_mutex> lock(box_lock_);
                 
                 simple_operation();
+                segment_lock_.unlock_shared();
+                libox_lock_.unlock_shared();
             }
         }
         
@@ -297,7 +376,7 @@ public:
         std::cout << "Lock-Free Read:                  " << lockfree_read_time << " ns" << std::endl;
         std::cout << "Optimistic Read:                 " << optimistic_read_time << " ns" << std::endl;
         std::cout << "Optimistic Write:                " << optimistic_write_time << " ns" << std::endl;
-        std::cout << "Optimistic Mixed (90% read):     " << optimistic_mixed_time << " ns" << std::endl;
+        std::cout << "Optimistic Mixed (50% read):     " << optimistic_mixed_time << " ns" << std::endl;
         std::cout << "ThreadLocal+Shared Read:         " << threadlocal_read_time << " ns" << std::endl;
         std::cout << "ThreadLocal+Exclusive Write:     " << threadlocal_write_time << " ns" << std::endl;
         std::cout << "ThreadLocal Mixed (50/50):       " << threadlocal_mixed_time << " ns" << std::endl;
