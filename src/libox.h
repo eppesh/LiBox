@@ -44,6 +44,34 @@ inline void exponential_backoff(int retry_count) {
     std::this_thread::sleep_for(std::chrono::microseconds(backoff));
 }
 
+class ThreadIdManager {
+private:
+    static thread_local int cached_thread_id_;
+    static int max_thread_num_;
+
+public:
+    static void initialize(int max_threads) {
+        max_thread_num_ = max_threads;
+    }
+    
+    static int get_thread_id() {
+        if (cached_thread_id_ == -1) {
+            cached_thread_id_ = omp_get_thread_num();
+            if (cached_thread_id_ >= max_thread_num_) {
+                cached_thread_id_ = cached_thread_id_ % max_thread_num_;
+            }
+        }
+        return cached_thread_id_;
+    }
+    
+    static void refresh_cache() {
+        cached_thread_id_ = -1;
+    }
+};
+
+thread_local int ThreadIdManager::cached_thread_id_ = -1;
+int ThreadIdManager::max_thread_num_ = 0;
+
 class ThreadLocalCounter {
 private:
     struct alignas(64) ThreadCounter {
@@ -53,15 +81,6 @@ private:
     
     std::unique_ptr<ThreadCounter[]> thread_counters_;
     int thread_num_;
-    
-    int get_thread_slot() const {
-        int thread_id = omp_get_thread_num();
-        if (thread_id >= thread_num_) {
-            thread_id = thread_id % thread_num_;
-        }
-        return thread_id;
-    }
-    
 public:
     explicit ThreadLocalCounter(int thread_num) 
         : thread_num_(thread_num) {
@@ -69,12 +88,12 @@ public:
     }
     
     void increment() {
-        int slot = get_thread_slot();
+        int slot = ThreadIdManager::get_thread_id();
         thread_counters_[slot].count.fetch_add(1, std::memory_order_relaxed);
     }
     
     void decrement() {
-        int slot = get_thread_slot();
+        int slot = ThreadIdManager::get_thread_id();
         thread_counters_[slot].count.fetch_sub(1, std::memory_order_relaxed);
     }
 
@@ -933,25 +952,30 @@ private:
     static std::atomic<uint64_t> next_structure_id_;
 
     std::atomic<bool> is_segment_splitting_{false};
-    
+
+    struct DeletionInfo {
+        IndexStructure<KeyType, ValueType>* structure;
+        int32_t replaced_segment_index;
+    };
+
     class EpochBasedReclamation {
     private:
         struct alignas(128) ThreadSpecificEBRInfo {
-            std::atomic<uint32_t> local_epoch{3};
-            uint32_t previously_accessed_epoch{3};
-            bool thread_wants_to_advance{false};
-
-            std::array<std::vector<IndexStructure<KeyType, ValueType>*>, 3> free_lists;
-            char padding[128 - sizeof(local_epoch) - sizeof(previously_accessed_epoch) 
-                            - sizeof(thread_wants_to_advance) - sizeof(free_lists)];
+            std::atomic<uint32_t> current_epoch_{0};
+            uint32_t previously_accessed_epoch_{0};
+            std::atomic<bool> doing_operation_{false};
+            
+            std::array<std::vector<DeletionInfo>, 3> free_lists_;
+            
+            char padding_[128 - sizeof(current_epoch_) - sizeof(previously_accessed_epoch_) 
+                             - sizeof(doing_operation_) - sizeof(free_lists_)];
             
             ThreadSpecificEBRInfo() = default;
             
-            ThreadSpecificEBRInfo(const ThreadSpecificEBRInfo& other) = delete;
-            ThreadSpecificEBRInfo& operator=(const ThreadSpecificEBRInfo& other) = delete;
-            
-            ThreadSpecificEBRInfo(ThreadSpecificEBRInfo&& other) = delete;
-            ThreadSpecificEBRInfo& operator=(ThreadSpecificEBRInfo&& other) = delete;
+            ThreadSpecificEBRInfo(const ThreadSpecificEBRInfo&) = delete;
+            ThreadSpecificEBRInfo& operator=(const ThreadSpecificEBRInfo&) = delete;
+            ThreadSpecificEBRInfo(ThreadSpecificEBRInfo&&) = delete;
+            ThreadSpecificEBRInfo& operator=(ThreadSpecificEBRInfo&&) = delete;
             
             ~ThreadSpecificEBRInfo() {
                 for (uint32_t i = 0; i < 3; ++i) {
@@ -959,61 +983,48 @@ private:
                 }
             }
             
-            void schedule_for_deletion(IndexStructure<KeyType, ValueType>* structure) {
-                uint32_t current_epoch = local_epoch.load(std::memory_order_acquire);
-                assert(current_epoch != 3);
-                free_lists[current_epoch].emplace_back(structure);
-                thread_wants_to_advance = (free_lists[current_epoch].size() % 64u) == 0;
-            }
-            
-            uint32_t get_local_epoch() const {
-                return local_epoch.load(std::memory_order_acquire);
-            }
-            
-            void enter(uint32_t new_epoch) {
-                assert(local_epoch.load() == 3);
-                if (previously_accessed_epoch != new_epoch) {
-                    free_for_epoch(new_epoch);
-                    thread_wants_to_advance = false;
-                    previously_accessed_epoch = new_epoch;
+            void schedule_for_deletion(IndexStructure<KeyType, ValueType>* structure, 
+                                     int32_t replaced_seg_idx, uint32_t epoch) {
+                if (structure) {
+                    free_lists_[epoch % 3].emplace_back(DeletionInfo{structure, replaced_seg_idx});
                 }
-                local_epoch.store(new_epoch, std::memory_order_release);
             }
             
-            void leave() {
-                local_epoch.store(3, std::memory_order_release);
-            }
-            
-            bool wants_to_advance_epoch() const {
-                return thread_wants_to_advance;
-            }
-            
-        private:
             void free_for_epoch(uint32_t epoch) {
-                std::vector<IndexStructure<KeyType, ValueType>*>& free_list = free_lists[epoch];
-                for (auto* structure : free_list) {
-                    delete_structure(structure);
+                std::vector<DeletionInfo>& free_list = free_lists_[epoch % 3];
+                for (const auto& info : free_list) {
+                    if (info.structure) {
+                        delete_index_structure_safely(info.structure, info.replaced_segment_index);
+                    }
                 }
                 free_list.clear();
             }
             
-            void delete_structure(IndexStructure<KeyType, ValueType>* structure) {
+            uint32_t get_current_epoch() const {
+                return current_epoch_.load(std::memory_order_acquire);
+            }
+            
+            bool is_doing_operation() const {
+                return doing_operation_.load(std::memory_order_acquire);
+            }
+            
+        private:
+            void delete_index_structure_safely(IndexStructure<KeyType, ValueType>* structure, 
+                                              int32_t replaced_segment_index) {
                 if (!structure) return;
+                
+                if (replaced_segment_index >= 0 && 
+                    replaced_segment_index < static_cast<int32_t>(structure->segments.size())) {
+                    delete structure->segments[replaced_segment_index];
+                }
                 delete structure;
             }
         };
         
-    public:
-        static constexpr uint32_t NEXT_EPOCH[3] = {1, 2, 0};
-        static constexpr uint32_t PREVIOUS_EPOCH[3] = {2, 0, 1};
-        
-    private:
-        std::atomic<uint32_t> current_epoch_{0};
         std::unique_ptr<ThreadSpecificEBRInfo[]> thread_infos_;
         int max_threads_;
-
-        mutable std::atomic<int> next_thread_id_{0};
-
+        std::atomic<uint32_t> global_epoch_{0};
+        
         EpochBasedReclamation() = delete;
         
     public:
@@ -1024,73 +1035,116 @@ private:
         
         ~EpochBasedReclamation() = default;
         
-        void enter_critical_section() {
-            int thread_id = get_thread_id();
-            ThreadSpecificEBRInfo& current_info = thread_infos_[thread_id];
+        void enter_critical_section(int thread_id) {
+            thread_infos_[thread_id].current_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            thread_infos_[thread_id].doing_operation_.store(true, std::memory_order_release);
+        }
+        
+        void leave_critical_section(int thread_id) {
+            thread_infos_[thread_id].doing_operation_.store(false, std::memory_order_release);
+        }
+        
+        void schedule_for_deletion(IndexStructure<KeyType, ValueType>* structure, 
+                                 int32_t replaced_segment_index = -1) {
+            if (!structure) return;
             
-            uint32_t current_epoch = current_epoch_.load(std::memory_order_acquire);
-            current_info.enter(current_epoch);
+            int thread_id = ThreadIdManager::get_thread_id();
             
-            if (current_info.wants_to_advance_epoch() && can_advance(current_epoch)) {
-                uint32_t next_epoch = NEXT_EPOCH[current_epoch];
-                current_epoch_.compare_exchange_strong(current_epoch, next_epoch,
-                                                      std::memory_order_acq_rel,
-                                                      std::memory_order_acquire);
+            uint32_t current_global_epoch = global_epoch_.load(std::memory_order_acquire);
+            save_epoch_snapshot_to_all_threads(current_global_epoch);
+            
+            wait_for_all_threads_safe();
+            
+            thread_infos_[thread_id].schedule_for_deletion(structure, replaced_segment_index, current_global_epoch);
+            
+            cleanup_old_epochs(current_global_epoch);
+            
+            global_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        
+        uint32_t get_global_epoch() const {
+            return global_epoch_.load(std::memory_order_acquire);
+        }
+        
+        uint32_t get_thread_epoch(int thread_id) const {
+            if (thread_id >= 0 && thread_id < max_threads_) {
+                return thread_infos_[thread_id].get_current_epoch();
             }
+            return 0;
         }
         
-        void leave_critical_section() {
-            int thread_id = get_thread_id();
-            ThreadSpecificEBRInfo& current_info = thread_infos_[thread_id];
-            current_info.leave();
-        }
-        
-        void schedule_for_deletion(IndexStructure<KeyType, ValueType>* structure) {
-            int thread_id = get_thread_id();
-            thread_infos_[thread_id].schedule_for_deletion(structure);
+        bool is_thread_active(int thread_id) const {
+            if (thread_id >= 0 && thread_id < max_threads_) {
+                return thread_infos_[thread_id].is_doing_operation();
+            }
+            return false;
         }
         
     private:
-        int get_thread_id() const {
-            thread_local static int cached_thread_id = -1;
-            if (cached_thread_id == -1) {
-                cached_thread_id = next_thread_id_.fetch_add(1, std::memory_order_acq_rel) % max_threads_;
+        void save_epoch_snapshot_to_all_threads(uint32_t epoch) {
+            for (int i = 0; i < max_threads_; ++i) {
+                thread_infos_[i].previously_accessed_epoch_ = epoch;
             }
-            return cached_thread_id;
         }
         
-        bool can_advance(uint32_t current_epoch) {
-            uint32_t previous_epoch = PREVIOUS_EPOCH[current_epoch];
-            
-            for (int i = 0; i < max_threads_; ++i) {
-                uint32_t thread_epoch = thread_infos_[i].get_local_epoch();
-                if (thread_epoch == previous_epoch) {
-                    return false;
+        void wait_for_all_threads_safe() {
+            for (int thread_idx = 0; thread_idx < max_threads_; ++thread_idx) {
+                ThreadSpecificEBRInfo& info = thread_infos_[thread_idx];
+                
+                while (true) {
+                    if (!info.doing_operation_.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    
+                    if (info.current_epoch_.load(std::memory_order_acquire) > info.previously_accessed_epoch_) {
+                        break;
+                    }
+                    
+                    std::this_thread::yield();
                 }
             }
-            return true;
+        }
+        
+        void cleanup_old_epochs(uint32_t current_epoch) {
+            if (current_epoch >= 3) {
+                uint32_t old_epoch = current_epoch - 3;
+                
+                for (int i = 0; i < max_threads_; ++i) {
+                    thread_infos_[i].free_for_epoch(old_epoch);
+                }
+            }
         }
     };
-    
+
     EpochBasedReclamation ebr_;
 
     class EpochGuard {
     private:
         EpochBasedReclamation* ebr_;
+        int thread_id_;
         
     public:
-        explicit EpochGuard(EpochBasedReclamation* ebr) : ebr_(ebr) {
-            ebr_->enter_critical_section();
+        explicit EpochGuard(EpochBasedReclamation* ebr) 
+            : ebr_(ebr), thread_id_(ThreadIdManager::get_thread_id()) {
+            ebr_->enter_critical_section(thread_id_);
         }
         
         ~EpochGuard() {
-            ebr_->leave_critical_section();
+            ebr_->leave_critical_section(thread_id_);
         }
         
         EpochGuard(const EpochGuard&) = delete;
         EpochGuard& operator=(const EpochGuard&) = delete;
         EpochGuard(EpochGuard&&) = delete;
         EpochGuard& operator=(EpochGuard&&) = delete;
+        
+        int get_thread_id() const {
+            return thread_id_;
+        }
+        
+        EpochBasedReclamation* get_ebr() const {
+            return ebr_;
+        }
     };
 
     uint64_t generateNewStructureId() {
@@ -1119,6 +1173,7 @@ public:
           overflowThreshold(oThreshold),
           thread_num(thread_num),
           ebr_(thread_num) {
+        ThreadIdManager::initialize(thread_num);
         auto* initial = new IndexStructure<KeyType, ValueType>();
         initial->structure_id = generateNewStructureId();
         index_structure_.store(initial);
