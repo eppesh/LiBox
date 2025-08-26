@@ -1,17 +1,27 @@
 CXX = g++
 
 SRC = ./test/benchmark.cpp
+HEADERS = ./src/libox.h ./src/segmentation.h ./src/libox_utils.h
 TARGET = ./test/benchmark
 
 THREAD_MODE ?= 1
 
 COMMON_FLAGS = --std=c++20 -faligned-new -march=native -fopenmp 
 
-all:
+all: $(TARGET)
+
+$(TARGET): $(HEADERS) $(SRC)
 	$(CXX) -O3 $(COMMON_FLAGS) -DNDEBUG $(SRC) -o $(TARGET)
 
-debug:
-	$(CXX) -g $(COMMON_FLAGS) $(SRC) -o $(TARGET)_debug
+debug: $(TARGET)_debug
+
+$(TARGET)_debug: $(HEADERS) $(SRC)
+	$(CXX) -O0 -g $(COMMON_FLAGS) $(SRC) -o $(TARGET)_debug
+
+prof: $(TARGET)_prof
+
+$(TARGET)_prof: $(HEADERS) $(SRC)
+	$(CXX) -O2 -pg $(COMMON_FLAGS) -DNDEBUG $(SRC) -o $(TARGET)_prof
 
 
 MAC_FLAGS ?= $(MAC_RELEASE_FLAGS)
@@ -40,4 +50,4 @@ segment_debug:
 	$(CXX) $(MAC_DEBUG_FLAGS) src/segmentation.cpp -o segmentation_debug
 
 clean:
-	rm -f $(TARGET) $(TARGET)_debug partition_optimization partition_optimization_debug ratio_by_win ratio_by_win_debug seg_len_by_win seg_len_by_win_debug segmentation segmentation_debug
+	rm -f $(TARGET) $(TARGET)_debug $(TARGET)_prof partition_optimization partition_optimization_debug ratio_by_win ratio_by_win_debug seg_len_by_win seg_len_by_win_debug segmentation segmentation_debug

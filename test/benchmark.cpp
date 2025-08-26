@@ -17,7 +17,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <cstring> 
+#include <cstring>
 #include <queue>
 #include <random>
 #include <sstream>
@@ -80,29 +80,30 @@ bool get_boolean_flag (const FlagMap& flags, const string& key) {
 // execute operations, and perform local dynamic adjustments
 //==============================================
 using KeyType = int64_t;
-using ValueType = int64_t; 
+using ValueType = int64_t;
 
+__attribute__((no_instrument_function))
 vector<pair<KeyType, KeyType>> read_range_queries(const string& range_file_path) {
     vector<pair<KeyType, KeyType>> range_queries;
     ifstream fin(range_file_path);
     if (!fin) {
         throw runtime_error("Unable to open range queries file: " + range_file_path);
     }
-    
+
     string line;
     while (getline(fin, line)) {
         if (line.empty()) continue;
-        
+
         size_t comma_pos = line.find(',');
         if (comma_pos == string::npos) {
             cerr << "Warning: Invalid line format in range queries file: " << line << endl;
             continue;
         }
-        
+
         try {
             KeyType start_key = stoll(line.substr(0, comma_pos));
             KeyType end_key = stoll(line.substr(comma_pos + 1));
-            
+
             if (start_key <= end_key) {
                 range_queries.push_back({start_key, end_key});
             } else {
@@ -112,44 +113,46 @@ vector<pair<KeyType, KeyType>> read_range_queries(const string& range_file_path)
             cerr << "Warning: Error parsing line: " << line << " - " << e.what() << endl;
         }
     }
-    
+
     fin.close();
     cout << "Read " << range_queries.size() << " range queries from file." << endl;
     return range_queries;
 }
 
-bool validate_range_results(const vector<pair<KeyType, ValueType>>& results, 
+__attribute__((no_instrument_function))
+bool validate_range_results(const vector<pair<KeyType, ValueType>>& results,
                            KeyType start_key, KeyType end_key) {
     for (const auto& result : results) {
         if (result.first < start_key || result.first > end_key) {
             return false;
         }
     }
-    
+
     return true;
 }
 
+__attribute__((no_instrument_function))
 vector<pair<KeyType, int>> read_scan_queries(const string& scan_file_path) {
     vector<pair<KeyType, int>> scan_queries;
     ifstream fin(scan_file_path);
     if (!fin) {
         throw runtime_error("Unable to open scan queries file: " + scan_file_path);
     }
-    
+
     string line;
     while (getline(fin, line)) {
         if (line.empty()) continue;
-        
+
         size_t comma_pos = line.find(',');
         if (comma_pos == string::npos) {
             cerr << "Warning: Invalid line format in scan queries file: " << line << endl;
             continue;
         }
-        
+
         try {
             KeyType start_key = stoll(line.substr(0, comma_pos));
             int scan_count = stoi(line.substr(comma_pos + 1));
-            
+
             if (scan_count > 0) {
                 scan_queries.push_back({start_key, scan_count});
             } else {
@@ -159,33 +162,35 @@ vector<pair<KeyType, int>> read_scan_queries(const string& scan_file_path) {
             cerr << "Warning: Error parsing scan query line: " << line << " - " << e.what() << endl;
         }
     }
-    
+
     fin.close();
     cout << "Read " << scan_queries.size() << " scan queries from file." << endl;
     return scan_queries;
 }
 
-bool validate_scan_results(const vector<pair<KeyType, ValueType>>& results, 
+__attribute__((no_instrument_function))
+bool validate_scan_results(const vector<pair<KeyType, ValueType>>& results,
                           KeyType start_key, int expected_count) {
     if (results.size() > expected_count) {
         return false;
     }
-    
+
     // for (size_t i = 1; i < results.size(); i++) {
     //     if (results[i].first <= results[i-1].first) {
     //         return false;
     //     }
     // }
-    
+
     for (const auto& result : results) {
         if (result.first < start_key) {
             return false;
         }
     }
-    
+
     return true;
 }
 
+__attribute__((no_instrument_function))
 int main (int argc, char* argv[]) {
     // Parse command-line arguments
     auto flags = parse_flags (argc, argv);
@@ -206,7 +211,7 @@ int main (int argc, char* argv[]) {
     bool validate_range_results_flag = get_boolean_flag (flags, "validate_range_results");
     int range_search_repeat = stoi (get_with_default (flags, "range_search_repeat", "1"));
 
-    // scan 
+    // scan
     bool enable_scan_mode = get_boolean_flag(flags, "enable_scan_mode");
     string scan_queries_file = get_with_default(flags, "scan_queries_file", "");
     bool validate_scan_results_flag = get_boolean_flag(flags, "validate_scan_results");
@@ -344,7 +349,7 @@ int main (int argc, char* argv[]) {
                     inserted++;
                 }
             }
-            
+
             inserts_end_time = chrono::high_resolution_clock::now ();
 
             batch_insert_time =
@@ -395,7 +400,7 @@ int main (int argc, char* argv[]) {
             enable_scan_mode = false;
         }
     }
-    
+
     std::ifstream fs (output_path);
     if (!fs.is_open ()) {
         std::ofstream ofile;
@@ -431,6 +436,9 @@ int main (int argc, char* argv[]) {
         cout << "Found " << cumulative_found << " matches out of " << cumulative_lookups << " lookups ("
             << (static_cast<double> (cumulative_found) / cumulative_lookups * 100.0) << "%)" << endl;
     }
+
+    // Print wait timing statistics
+    index.printWaitTimingStats();
 
     return 0;
 }
