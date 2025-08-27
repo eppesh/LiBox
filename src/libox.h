@@ -31,7 +31,7 @@
 
 #include "segmentation.h"
 
-#define overflowCapacity 5
+#define overflowCapacity 3
 #define maxKey 64
 
 volatile int dummy;
@@ -816,17 +816,13 @@ public:
         if (!enter()) {
             return {InsertStatus::SPLIT, -1};
         }
-        if (key < lower_bound || key > upper_bound) {
+        if (key < lower_bound || key >= upper_bound) {
             leave();
             return {InsertStatus::OUT_OF_RANGE, -1};
         }
 
         size_t box_index = (key - lower_bound) / box_key_range;
         InsertResult ret = boxes[box_index].insertKeyValue(key, value);
-        if (ret.status == InsertStatus::FULL) {
-            ret.box_index = static_cast<int>(box_index);
-        }
-
         leave();
         return ret;
     }
@@ -861,22 +857,17 @@ public:
         return result;
     }
 
-    vector<pair<KeyType, ValueType>> prepare_for_split_stage1(int32_t box_index) {
-        int left_count = 3;
-        int right_count = 3;
-        int merge_start = std::max(0, box_index - left_count);
-        int merge_end = std::min(static_cast<int>(boxes.size()) - 1, box_index + right_count);
-        
+    vector<pair<KeyType, ValueType>> prepare_for_split_stage1() {
         vector<pair<KeyType, ValueType>> mergedEntries;
-        for (int i = merge_start; i <= merge_end; i++) {
+        
+        for (int i = 0; i < static_cast<int>(boxes.size()); i++) {
             auto entries = boxes[i].getEntries();
             mergedEntries.insert(mergedEntries.end(), entries.begin(), entries.end());
         }
-        
         std::sort(mergedEntries.begin(), mergedEntries.end(),
-                 [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
-                     return a.first < b.first;
-                 });
+            [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
+                return a.first < b.first;
+            });
         return mergedEntries;
     }
 
@@ -938,8 +929,8 @@ struct IndexStructure {
 template <typename KeyType, typename ValueType>
 class LiBox {
 private:
-    int underflowThreshold;
-    int overflowThreshold;
+    double underflowThreshold;
+    double overflowThreshold;
     int thread_num;
 
     std::atomic<IndexStructure<KeyType, ValueType>*> index_structure_;
@@ -1083,7 +1074,7 @@ private:
     private:
         void save_epoch_snapshot_to_all_threads(uint32_t epoch) {
             for (int i = 0; i < max_threads_; ++i) {
-                thread_infos_[i].previously_accessed_epoch_ = epoch;
+                thread_infos_[i].previously_accessed_epoch_ = thread_infos_[i].current_epoch_.load(std::memory_order_acquire);
             }
         }
         
@@ -1168,7 +1159,7 @@ private:
         splitting_segment_.store(-1, std::memory_order_release);
     }
 public:
-    LiBox(int uThreshold, int oThreshold, int thread_num)
+    LiBox(double uThreshold, double oThreshold, int thread_num)
         : underflowThreshold(uThreshold),
           overflowThreshold(oThreshold),
           thread_num(thread_num),
@@ -1188,25 +1179,31 @@ public:
     }
 
     InsertResult insertKeyValue(KeyType key, ValueType value) {
-        EpochGuard guard(&ebr_);
+        InsertResult result;
         int retry_count = 0;
-        
-    retry_insert:
-        auto* structure = index_structure_.load(std::memory_order_acquire);
-        int32_t seg_index = searchIndex(structure, key);
-        if (index_structure_.load()->structure_id != structure->structure_id) {
-            exponential_backoff(retry_count++);
-            goto retry_insert;
+        int32_t seg_index = -1;
+
+        retry_insert:
+        {
+            EpochGuard guard(&ebr_);
+            auto* structure = index_structure_.load(std::memory_order_acquire);
+            seg_index = searchIndex(structure, key);
+            if (index_structure_.load()->structure_id != structure->structure_id) {
+                exponential_backoff(retry_count++);
+                goto retry_insert;
+            }
+            
+            result = structure->segments[seg_index]->insertKeyValue(key, value);
+            if (result.status == InsertStatus::SUCCESS) {
+                return result;
+            }
         }
-        
-        InsertResult result = structure->segments[seg_index]->insertKeyValue(key, value);
-        if (result.status == InsertStatus::SUCCESS) {
-            return result;
-        } else if (result.status == InsertStatus::FULL) {
+
+        if (result.status == InsertStatus::FULL) {
             if (!is_segment_splitting(seg_index) && splitting_segment_.load(std::memory_order_acquire) == -1) {
                 if (mark_segment_splitting(seg_index)) {
                     is_segment_splitting_.store(true, std::memory_order_release);
-                    splitSegment(seg_index, result.box_index);
+                    splitSegment(seg_index);
                 }
                 exponential_backoff(retry_count++);
                 goto retry_insert;
@@ -1222,7 +1219,6 @@ public:
             is_segment_splitting_.wait(false, std::memory_order_acquire);
             goto retry_insert;
         }
-        
         return result;
     }
 
@@ -1268,36 +1264,57 @@ public:
         return ret;
     }
 
-    void splitSegment(int32_t seg_index, int32_t box_index) {
+    void populateSegmentsSerial(const vector<pair<KeyType, ValueType>>& mergedEntries,
+                        vector<Segment<KeyType, ValueType>*>& new_segments) {
+        size_t current_seg = 0;
+        for (const auto& entry : mergedEntries) {
+            KeyType key = entry.first;
+            ValueType value = entry.second;
+            if (key >= new_segments[current_seg]->getUpperBound()) {
+                current_seg++;
+            }
+            new_segments[current_seg]->insertKeyValue(key, value);
+        }
+    }
+    
+    void splitSegment(int32_t seg_index) {
+        cout << "splitting segment " << seg_index << endl;
         if (!global_splitting_.exchange(true)) {
             auto* current = index_structure_.load();
             auto* segment = current->segments[seg_index];
             
             segment->wait_for_operations();
-            auto mergedEntries = segment->prepare_for_split_stage1(box_index);
+            auto mergedEntries = segment->prepare_for_split_stage1();
             if (mergedEntries.empty()) {
                 unmark_segment_splitting(seg_index);
                 global_splitting_.store(false);
                 return;
             }
-            
-            KeyType mid_key = mergedEntries[mergedEntries.size() / 2].first;
-            auto* seg1 = new Segment<KeyType, ValueType>(
-                segment->getLowerBound(), mid_key - 1, 
-                segment->getBoxKeyRange(), thread_num);
-            auto* seg2 = new Segment<KeyType, ValueType>(
-                mid_key, segment->getUpperBound(), 
-                segment->getBoxKeyRange(), thread_num);
-            
+            //
+            vector<KeyType> keys;
+            keys.reserve(mergedEntries.size());
             for (const auto& entry : mergedEntries) {
-                if (entry.first <= mid_key - 1) {
-                    seg1->boxes[0].insertKeyValue(entry.first, entry.second);
-                } else {
-                    seg2->boxes[0].insertKeyValue(entry.first, entry.second);
-                }
+                keys.push_back(entry.first);
+            }
+            std::vector<keySegment<KeyType>> keysegments = 
+                calculateSegments(keys, overflowThreshold, underflowThreshold, 15, segment->getLowerBound() , segment->getUpperBound());
+            std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
+
+            std::vector<Segment<KeyType, ValueType>*> new_segments;
+            new_segments.reserve(final_segments.size());
+            for (const auto& struct_seg : final_segments) {
+                auto* new_seg = new Segment<KeyType, ValueType>(
+                    struct_seg.seg_lower, 
+                    struct_seg.seg_upper, 
+                    struct_seg.box_range, 
+                    thread_num
+                );
+                new_segments.push_back(new_seg);
             }
             
-            atomicReplaceIndexStructure(seg_index, {seg1, seg2});
+            populateSegmentsSerial(mergedEntries, new_segments);
+
+            atomicReplaceIndexStructure(seg_index, new_segments);
             
             delete segment;
             is_segment_splitting_.store(false, std::memory_order_release);

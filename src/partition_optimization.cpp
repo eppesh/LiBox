@@ -106,7 +106,7 @@ int main(int argc, char* argv[]) {
     double underflow_threshold = 0.5;
     double overflow_threshold = 0.1;
     auto start_time = std::chrono::high_resolution_clock::now();
-    std::vector<Segment<KeyType>> segments =
+    std::vector<keySegment<KeyType>> segments =
         calculateSegments(data, overflow_threshold, underflow_threshold, max_look_ahead, data[0], data[0]);
     auto end_time = std::chrono::high_resolution_clock::now();
     std::vector<StructSegment<KeyType>> final_segments = toStructSegment(segments);

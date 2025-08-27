@@ -14,7 +14,7 @@ using namespace liboxns;
 
 namespace seg {
 template <typename KeyType>
-struct Segment {
+struct keySegment {
     size_t start_idx;
     KeyType start_key;
     size_t end_idx; // exclusive
@@ -25,7 +25,7 @@ struct Segment {
     size_t cum_underflow = 0;
     size_t cum_overflow = 0;
 
-    Segment(const size_t start_i, KeyType start_k, KeyType window) {
+    keySegment(const size_t start_i, KeyType start_k, KeyType window) {
         start_idx = start_i;
         end_idx = start_i;
         start_key = start_k;
@@ -33,7 +33,7 @@ struct Segment {
         window_size = window;
     }
 
-    void expand_to(const Segment<KeyType>& seg) {
+    void expand_to(const keySegment<KeyType>& seg) {
         end_idx = seg.end_idx;
         end_key = seg.end_key;
         cum_keys = seg.cum_keys;
@@ -65,15 +65,15 @@ size_t find_lower(const std::vector<KeyType>& data,
 // over/underflow ratios are under the thresholds. Looks ahead at most max_look_ahead when the
 // thresholds are not met in an attempt to meet them.
 template <typename KeyType>
-Segment<KeyType> makeSegment(const std::vector<KeyType>& data,
+keySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
                              const size_t start_idx,
                              const KeyType start_key,
                              const KeyType window_size,
                              const double overflow_threshold,
                              const double underflow_threshold,
                              const size_t max_look_ahead) {
-    Segment<KeyType> seg(start_idx, start_key, window_size);
-    Segment<KeyType> valid_seg(start_idx, start_key, window_size);
+    keySegment<KeyType> seg(start_idx, start_key, window_size);
+    keySegment<KeyType> valid_seg(start_idx, start_key, window_size);
 #ifndef NDEBUG
     if (data[start_idx] < start_key || (start_idx != 0 && data[start_idx - 1] >= start_key)) {
         std::cout << "uh oh\n"; // debug
@@ -129,18 +129,18 @@ Segment<KeyType> makeSegment(const std::vector<KeyType>& data,
 }
 
 template <typename KeyType>
-Segment<KeyType> findBestSegment(const std::vector<KeyType>& data,
+keySegment<KeyType> findBestSegment(const std::vector<KeyType>& data,
                                  const size_t start_idx,
                                  const KeyType start_key,
                                  const std::vector<KeyType>& window_candidates,
                                  const double overflow_threshold,
                                  const double underflow_threshold,
                                  const size_t max_look_ahead) {
-    Segment<KeyType> best_seg(start_idx, start_key, 0);
+    keySegment<KeyType> best_seg(start_idx, start_key, 0);
     size_t max_keys = 0;
 
     for (auto& window_size : window_candidates) {
-        Segment<KeyType> seg = makeSegment(data,
+        keySegment<KeyType> seg = makeSegment(data,
                                            start_idx,
                                            start_key,
                                            window_size,
@@ -206,9 +206,9 @@ long long wind_cand_idx_sum = 0;
 #endif
 
 template <typename KeyType>
-std::vector<StructSegment<KeyType>> toStructSegment(const std::vector<Segment<KeyType>>& my_segs) {
+std::vector<StructSegment<KeyType>> toStructSegment(const std::vector<keySegment<KeyType>>& my_segs) {
     std::vector<StructSegment<KeyType>> segs;
-    for (const Segment<KeyType>& my_seg : my_segs) {
+    for (const keySegment<KeyType>& my_seg : my_segs) {
         StructSegment<KeyType> seg;
         seg.seg_lower = my_seg.start_key;
         seg.seg_upper = my_seg.end_key;
@@ -219,20 +219,20 @@ std::vector<StructSegment<KeyType>> toStructSegment(const std::vector<Segment<Ke
 }
 
 template <typename KeyType>
-std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data,
+std::vector<keySegment<KeyType>> calculateSegments(const std::vector<KeyType>& data,
                                                 const double overflow_threshold,
                                                 const double underflow_threshold,
                                                 const size_t max_look_ahead,
                                                 const KeyType newseg_lower,
                                                 const KeyType newseg_upper) {
-    std::vector<Segment<KeyType>> segments;
+    std::vector<keySegment<KeyType>> segments;
     size_t cur_idx = 0;
     KeyType cur_key = newseg_lower <= data[0] ? newseg_lower : data[0];
     while (cur_idx < data.size() && cur_key <= data.back() + 1) {
         if (data.size() - cur_idx < (1 - underflow_threshold) * BOX_CAPACITY) {
             // the remaining data cannot be made into a valid box, so we forcibly create an
             // underflowing segment
-            Segment<KeyType> seg(cur_idx, cur_key, data.back() - cur_key);
+            keySegment<KeyType> seg(cur_idx, cur_key, data.back() - cur_key);
             seg.end_idx = data.size();
             seg.end_key = data.back() + 1;
             segments.push_back(seg);
@@ -240,7 +240,7 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
         }
 
         std::vector<KeyType> window_candidates = getWindowCandidates(data, cur_idx, cur_key);
-        Segment<KeyType> seg = findBestSegment(data,
+        keySegment<KeyType> seg = findBestSegment(data,
                                                cur_idx,
                                                cur_key,
                                                window_candidates,
@@ -267,7 +267,7 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
         segments.push_back(seg);
     }
 
-    Segment<KeyType>& last_seg = segments.back();
+    keySegment<KeyType>& last_seg = segments.back();
     if (newseg_upper > last_seg.end_key) last_seg.end_key = newseg_upper;
 
     return segments;
@@ -275,7 +275,7 @@ std::vector<Segment<KeyType>> calculateSegments(const std::vector<KeyType>& data
 
 template <typename KeyType>
 bool validateSegments(const std::vector<KeyType>& data,
-                      const std::vector<Segment<KeyType>>& my_segs) {
+                      const std::vector<keySegment<KeyType>>& my_segs) {
     std::vector<StructSegment<KeyType>> segs = toStructSegment(my_segs);
 
     KeyType start_key = data[0];
