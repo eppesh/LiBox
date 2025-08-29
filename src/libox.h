@@ -31,6 +31,8 @@
 
 #include "segmentation.h"
 
+#define SORT_BOX
+
 // for Box lock, define one
 #define LOCK_SEARCH
 //#define LOCK_SEARCH_SPIN_LOCK
@@ -999,7 +1001,7 @@ public:
         return result;
     }
 
-        vector<pair<KeyType, ValueType>> prepare_for_split_stage1() {
+    vector<pair<KeyType, ValueType>> prepare_for_split_stage1() {
         // Pre-calculate total size to avoid reallocations
         size_t total_size = 0;
         for (const auto& box : boxes) {
@@ -1009,16 +1011,30 @@ public:
         vector<pair<KeyType, ValueType>> mergedEntries;
         mergedEntries.reserve(total_size);
 
-        // Collect entries from boxes directly to avoid copies
+        // Collect entries from boxes and sort incrementally
         for (int i = 0; i < static_cast<int>(boxes.size()); i++) {
+            size_t start_size = mergedEntries.size();
             boxes[i].getEntriesInPlace(&mergedEntries);
+            size_t end_size = mergedEntries.size();
+
+#ifdef SORT_BOX
+            // Sort only the newly added entries from this box
+            if (end_size > start_size) {
+                std::sort(mergedEntries.begin() + start_size, mergedEntries.end(),
+                    [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
+                        return a.first < b.first;
+                    });
+            }
+#endif
         }
 
+#ifndef SORT_BOX
         // Sort the merged entries
         std::sort(mergedEntries.begin(), mergedEntries.end(),
             [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
                 return a.first < b.first;
             });
+#endif
 
         // Debug check
         #ifndef NDEBUG
