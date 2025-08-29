@@ -372,6 +372,12 @@ class OverflowKeyValue {
         return entries;
     }
 
+    void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries) const {
+        for (size_t i = 0; i < maxSize; i++) {
+            entries->push_back({keys[i], values[i]});
+        }
+    }
+
     std::unique_ptr<OverflowKeyValue<KeyType, ValueType>> clone() const {
         auto newObj = std::make_unique<OverflowKeyValue<KeyType, ValueType>>();
         newObj->maxSize = maxSize;
@@ -848,6 +854,15 @@ class Box {
         return entries;
     }
 
+    void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries) const {
+        for (size_t i = 0; i < maxSize; i++) {
+            entries->push_back({keys[i], values[i]});
+        }
+        for (int i = 0; i < capacity; i++) {
+            data[i]->getEntriesInPlace(entries);
+        }
+    }
+
     size_t getOverflowBoxCount() const {
         size_t cap;
         size_t first_overflow_size;
@@ -984,17 +999,39 @@ public:
         return result;
     }
 
-    vector<pair<KeyType, ValueType>> prepare_for_split_stage1() {
-        vector<pair<KeyType, ValueType>> mergedEntries;
-
-        for (int i = 0; i < static_cast<int>(boxes.size()); i++) {
-            auto entries = boxes[i].getEntries();
-            mergedEntries.insert(mergedEntries.end(), entries.begin(), entries.end());
+        vector<pair<KeyType, ValueType>> prepare_for_split_stage1() {
+        // Pre-calculate total size to avoid reallocations
+        size_t total_size = 0;
+        for (const auto& box : boxes) {
+            total_size += box.getTotalCount();
         }
+
+        vector<pair<KeyType, ValueType>> mergedEntries;
+        mergedEntries.reserve(total_size);
+
+        // Collect entries from boxes directly to avoid copies
+        for (int i = 0; i < static_cast<int>(boxes.size()); i++) {
+            boxes[i].getEntriesInPlace(&mergedEntries);
+        }
+
+        // Sort the merged entries
         std::sort(mergedEntries.begin(), mergedEntries.end(),
             [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
                 return a.first < b.first;
             });
+
+        // Debug check
+        #ifndef NDEBUG
+        for (size_t i = 1; i < mergedEntries.size(); i++) {
+            if (mergedEntries[i].first < mergedEntries[i - 1].first) {
+                std::cerr << "Merged entry " << i << " is not sorted!" << std::endl;
+                std::cerr << "Merged entry " << i << " is " << mergedEntries[i].first << " " << mergedEntries[i].second << std::endl;
+                std::cerr << "Merged entry " << i - 1 << " is " << mergedEntries[i - 1].first << " " << mergedEntries[i - 1].second << std::endl;
+                std::cerr << "Merged entries are not sorted!" << std::endl;
+            }
+        }
+        #endif
+
         return mergedEntries;
     }
 
@@ -1307,7 +1344,7 @@ private:
     }
 
     InsertResult insertToBoundaryBox(KeyType key, ValueType value, int32_t box_type) {
-        auto& boundary_box = (box_type == BELOW_LOWER_BOUND) ? 
+        auto& boundary_box = (box_type == BELOW_LOWER_BOUND) ?
                             small_boundary_box_ : big_boundary_box_;
         if (!boundary_box) {
             boundary_box = std::make_unique<Box<KeyType, ValueType>>();
@@ -1326,7 +1363,7 @@ private:
     }
 
     SearchResult<KeyType, ValueType> searchInBoundaryBox(KeyType key, int32_t box_type) {
-        const std::unique_ptr<Box<KeyType, ValueType>>& boundary_box = 
+        const std::unique_ptr<Box<KeyType, ValueType>>& boundary_box =
             (box_type == BELOW_LOWER_BOUND) ? small_boundary_box_ : big_boundary_box_;
         if (!boundary_box) {
             return {SearchStatus::NOT_FOUND, ValueType{}};
@@ -1335,7 +1372,7 @@ private:
     }
 
     DeleteResult deleteFromBoundaryBox(KeyType key, int32_t box_type) {
-        const std::unique_ptr<Box<KeyType, ValueType>>& boundary_box = 
+        const std::unique_ptr<Box<KeyType, ValueType>>& boundary_box =
             (box_type == BELOW_LOWER_BOUND) ? small_boundary_box_ : big_boundary_box_;
         if (!boundary_box) {
             return {DeleteStatus::NOT_FOUND, false};
@@ -1394,7 +1431,7 @@ public:
                 if (mark_segment_splitting(seg_index)) {
                     is_segment_splitting_.store(true, std::memory_order_release);
                     splitSegment(seg_index);
-                }else{                
+                }else{
                     exponential_backoff(retry_count++);
                     goto retry_insert;
                 }
@@ -1489,19 +1526,27 @@ public:
     }
 
     void splitSegment(int32_t seg_index) {
-        auto start_time = std::chrono::high_resolution_clock::now();
         auto split_start = std::chrono::high_resolution_clock::now();
         cout << "splitting segment " << seg_index << endl;
+
+        auto t1 = std::chrono::high_resolution_clock::now();
         if (!global_splitting_.exchange(true)) {
             auto* current = index_structure_.load();
             auto* segment = current->segments[seg_index];
+            auto t2 = std::chrono::high_resolution_clock::now();
 
             auto wait_start = std::chrono::high_resolution_clock::now();
             segment->wait_for_operations();
             auto wait_end = std::chrono::high_resolution_clock::now();
             auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
             wait_for_operations_stats_.record_wait(wait_duration);
+            auto t3 = std::chrono::high_resolution_clock::now();
+
             auto mergedEntries = segment->prepare_for_split_stage1();
+            auto t4 = std::chrono::high_resolution_clock::now();
+
+            size_t merged_entries_size = mergedEntries.size();
+
             if (mergedEntries.empty()) {
                 unmark_segment_splitting(seg_index);
                 global_splitting_.store(false);
@@ -1515,9 +1560,14 @@ public:
             for (const auto& entry : mergedEntries) {
                 keys.push_back(entry.first);
             }
+            auto t5 = std::chrono::high_resolution_clock::now();
+
             std::vector<keySegment<KeyType>> keysegments =
                 calculateSegments(keys, overflowThreshold, underflowThreshold, 15, segment->getLowerBound() , segment->getUpperBound());
+            auto t6 = std::chrono::high_resolution_clock::now();
+
             std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
+            auto t7 = std::chrono::high_resolution_clock::now();
 
             std::vector<Segment<KeyType, ValueType>*> new_segments;
             new_segments.reserve(final_segments.size());
@@ -1530,17 +1580,56 @@ public:
                 );
                 new_segments.push_back(new_seg);
             }
+            auto t8 = std::chrono::high_resolution_clock::now();
 
             populateSegmentsSerial(mergedEntries, new_segments);
+            auto t9 = std::chrono::high_resolution_clock::now();
 
-            atomicReplaceIndexStructure(seg_index, new_segments, start_time);
-            
-            delete segment; 
+            atomicReplaceIndexStructure(seg_index, new_segments, split_start);
+            auto t10 = std::chrono::high_resolution_clock::now();
+
+            delete segment;
             is_segment_splitting_.store(false, std::memory_order_release);
             is_segment_splitting_.notify_all();
+            auto t11 = std::chrono::high_resolution_clock::now();
 
             unmark_segment_splitting(seg_index);
             global_splitting_.store(false);
+            auto t12 = std::chrono::high_resolution_clock::now();
+
+            // Calculate timing breakdown
+            auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+            auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+            auto duration3 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
+            auto duration4 = std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count();
+            auto duration5 = std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
+            auto duration6 = std::chrono::duration_cast<std::chrono::microseconds>(t7 - t6).count();
+            auto duration7 = std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
+            auto duration8 = std::chrono::duration_cast<std::chrono::microseconds>(t9 - t8).count();
+            auto duration9 = std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
+            auto duration10 = std::chrono::duration_cast<std::chrono::microseconds>(t11 - t10).count();
+            auto duration11 = std::chrono::duration_cast<std::chrono::microseconds>(t12 - t11).count();
+
+            // Calculate total time and normalized time per 100k entries
+            auto total_time_us = duration1 + duration2 + duration3 + duration4 + duration5 +
+                                duration6 + duration7 + duration8 + duration9 + duration10 + duration11;
+            double normalized_time_per_100k = (merged_entries_size > 0) ?
+                (static_cast<double>(total_time_us) * 100000.0 / merged_entries_size) : 0.0;
+
+            std::cout << "splitSegment breakdown (us): "
+                      << "load=" << duration1 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration1 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "wait=" << duration2 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration2 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "prepare=" << duration3 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration3 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "keys=" << duration4 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration4 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "calculate=" << duration5 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration5 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "toStruct=" << duration6 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration6 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "create=" << duration7 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration7 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "populate=" << duration8 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration8 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "replace=" << duration9 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration9 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "cleanup=" << duration10 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration10 * 100.0 / total_time_us) : 0.0) << "%), "
+                      << "unmark=" << duration11 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration11 * 100.0 / total_time_us) : 0.0) << "%)"
+                      << " | mergedEntries_size=" << merged_entries_size
+                      << " | normalized_per_100k=" << std::fixed << std::setprecision(2) << normalized_time_per_100k << "us" << std::endl;
         }
 
         auto split_end = std::chrono::high_resolution_clock::now();
@@ -1580,7 +1669,7 @@ public:
         auto& redundantArray = structure->redundantArray;
         double a = structure->a;
         double b = structure->b;
-        
+
         if (key < segment_start_keys.front()) {
             return BELOW_LOWER_BOUND;
         } else if (key >= segment_start_keys.back()) {
@@ -1655,8 +1744,8 @@ public:
         return -1;
     }
 
-    void atomicReplaceIndexStructure(int32_t old_seg_idx, 
-                                     std::vector<Segment<KeyType, ValueType>*> new_segments, 
+    void atomicReplaceIndexStructure(int32_t old_seg_idx,
+                                     std::vector<Segment<KeyType, ValueType>*> new_segments,
                                      std::chrono::high_resolution_clock::time_point start_time) {
         auto* current = index_structure_.load(std::memory_order_acquire);
         auto* new_structure = new IndexStructure<KeyType, ValueType>();
