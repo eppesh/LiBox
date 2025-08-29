@@ -1150,6 +1150,22 @@ private:
     static ThreadLocalWaitTimingStats is_segment_splitting_search_wait_stats_;
     static ThreadLocalWaitTimingStats wait_for_operations_stats_;
 
+    // Accumulated timing statistics for splitSegment phases
+    static std::atomic<uint64_t> accumulated_load_time_us_;
+    static std::atomic<uint64_t> accumulated_wait_time_us_;
+    static std::atomic<uint64_t> accumulated_prepare_time_us_;
+    static std::atomic<uint64_t> accumulated_keys_time_us_;
+    static std::atomic<uint64_t> accumulated_calculate_time_us_;
+    static std::atomic<uint64_t> accumulated_toStruct_time_us_;
+    static std::atomic<uint64_t> accumulated_create_time_us_;
+    static std::atomic<uint64_t> accumulated_populate_time_us_;
+    static std::atomic<uint64_t> accumulated_replace_time_us_;
+    static std::atomic<uint64_t> accumulated_cleanup_time_us_;
+    static std::atomic<uint64_t> accumulated_unmark_time_us_;
+    static std::atomic<uint64_t> total_split_operations_;
+    static std::atomic<uint64_t> total_entries_processed_;
+    static std::atomic<uint64_t> total_segments_created_;
+
     static void initializeTimingStats(int thread_num) {
         // Re-initialize the static timing stats with the correct thread count
         is_segment_splitting_insert_wait_stats_ = ThreadLocalWaitTimingStats(thread_num, "LiBox is_segment_splitting (insert)");
@@ -1653,21 +1669,23 @@ public:
             double normalized_time_per_100k = (merged_entries_size > 0) ?
                 (static_cast<double>(total_time_us) * 100000.0 / merged_entries_size) : 0.0;
 
-            std::cout << "splitSegment breakdown (us): "
-                      << "load=" << duration1 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration1 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "wait=" << duration2 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration2 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "prepare=" << duration3 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration3 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "keys=" << duration4 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration4 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "calculate=" << duration5 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration5 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "toStruct=" << duration6 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration6 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "create=" << duration7 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration7 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "populate=" << duration8 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration8 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "replace=" << duration9 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration9 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "cleanup=" << duration10 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration10 * 100.0 / total_time_us) : 0.0) << "%), "
-                      << "unmark=" << duration11 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration11 * 100.0 / total_time_us) : 0.0) << "%)"
-                      << " | mergedEntries_size=" << merged_entries_size
-                      << " | new_segments_size=" << new_segments_size
-                      << " | normalized_per_100k=" << std::fixed << std::setprecision(2) << normalized_time_per_100k << "us" << std::endl;
+            // Accumulate timing statistics
+            accumulated_load_time_us_.fetch_add(duration1, std::memory_order_relaxed);
+            accumulated_wait_time_us_.fetch_add(duration2, std::memory_order_relaxed);
+            accumulated_prepare_time_us_.fetch_add(duration3, std::memory_order_relaxed);
+            accumulated_keys_time_us_.fetch_add(duration4, std::memory_order_relaxed);
+            accumulated_calculate_time_us_.fetch_add(duration5, std::memory_order_relaxed);
+            accumulated_toStruct_time_us_.fetch_add(duration6, std::memory_order_relaxed);
+            accumulated_create_time_us_.fetch_add(duration7, std::memory_order_relaxed);
+            accumulated_populate_time_us_.fetch_add(duration8, std::memory_order_relaxed);
+            accumulated_replace_time_us_.fetch_add(duration9, std::memory_order_relaxed);
+            accumulated_cleanup_time_us_.fetch_add(duration10, std::memory_order_relaxed);
+            accumulated_unmark_time_us_.fetch_add(duration11, std::memory_order_relaxed);
+
+            // Accumulate other statistics
+            total_split_operations_.fetch_add(1, std::memory_order_relaxed);
+            total_entries_processed_.fetch_add(merged_entries_size, std::memory_order_relaxed);
+            total_segments_created_.fetch_add(new_segments_size, std::memory_order_relaxed);
         }
 
         auto split_end = std::chrono::high_resolution_clock::now();
@@ -1913,6 +1931,60 @@ public:
         split_segment_total_stats.print_stats();
         exponential_backoff_stats.print_stats();
         std::cout << "==============================\n" << std::endl;
+
+        // Print accumulated splitSegment statistics
+        printAccumulatedSplitStats();
+    }
+
+    void printAccumulatedSplitStats() {
+        uint64_t total_ops = total_split_operations_.load(std::memory_order_relaxed);
+        if (total_ops == 0) {
+            std::cout << "No splitSegment operations performed." << std::endl;
+            return;
+        }
+
+        uint64_t load_time = accumulated_load_time_us_.load(std::memory_order_relaxed);
+        uint64_t wait_time = accumulated_wait_time_us_.load(std::memory_order_relaxed);
+        uint64_t prepare_time = accumulated_prepare_time_us_.load(std::memory_order_relaxed);
+        uint64_t keys_time = accumulated_keys_time_us_.load(std::memory_order_relaxed);
+        uint64_t calculate_time = accumulated_calculate_time_us_.load(std::memory_order_relaxed);
+        uint64_t toStruct_time = accumulated_toStruct_time_us_.load(std::memory_order_relaxed);
+        uint64_t create_time = accumulated_create_time_us_.load(std::memory_order_relaxed);
+        uint64_t populate_time = accumulated_populate_time_us_.load(std::memory_order_relaxed);
+        uint64_t replace_time = accumulated_replace_time_us_.load(std::memory_order_relaxed);
+        uint64_t cleanup_time = accumulated_cleanup_time_us_.load(std::memory_order_relaxed);
+        uint64_t unmark_time = accumulated_unmark_time_us_.load(std::memory_order_relaxed);
+
+        uint64_t total_entries = total_entries_processed_.load(std::memory_order_relaxed);
+        uint64_t total_segments = total_segments_created_.load(std::memory_order_relaxed);
+
+        uint64_t total_time = load_time + wait_time + prepare_time + keys_time + calculate_time +
+                             toStruct_time + create_time + populate_time + replace_time + cleanup_time + unmark_time;
+
+        std::cout << "\n=== Accumulated SplitSegment Statistics ===" << std::endl;
+        std::cout << "Total operations: " << total_ops << std::endl;
+        std::cout << "Total entries processed: " << total_entries << std::endl;
+        std::cout << "Total segments created: " << total_segments << std::endl;
+        std::cout << "Total time: " << total_time << "us" << std::endl;
+        std::cout << "Average time per operation: " << (total_time / total_ops) << "us" << std::endl;
+        std::cout << "Average entries per operation: " << (total_entries / total_ops) << std::endl;
+        std::cout << "Average segments per operation: " << (total_segments / total_ops) << std::endl;
+        std::cout << "Overall throughput: " << std::fixed << std::setprecision(2)
+                  << (total_time > 0 ? (total_entries * 1000000.0 / total_time) : 0.0) << " entries/sec" << std::endl;
+
+        std::cout << "\nPhase breakdown (accumulated):" << std::endl;
+        std::cout << "  load: " << load_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (load_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  wait: " << wait_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (wait_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  prepare: " << prepare_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (prepare_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  keys: " << keys_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (keys_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  calculate: " << calculate_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (calculate_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  toStruct: " << toStruct_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (toStruct_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  create: " << create_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (create_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  populate: " << populate_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (populate_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  replace: " << replace_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (replace_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  cleanup: " << cleanup_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (cleanup_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  unmark: " << unmark_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (unmark_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "==========================================\n" << std::endl;
     }
 };
 
@@ -1931,6 +2003,49 @@ public:
 
     template <typename KeyType, typename ValueType>
     ThreadLocalWaitTimingStats LiBox<KeyType, ValueType>::wait_for_operations_stats_(1, "Segment wait_for_operations");
+
+    // Static member definitions for accumulated timing stats
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_load_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_wait_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_prepare_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_keys_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_calculate_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_toStruct_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_create_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_populate_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_replace_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_cleanup_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_unmark_time_us_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::total_split_operations_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::total_entries_processed_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::total_segments_created_{0};
 
     //template <typename KeyType, typename ValueType>
     //ThreadLocalWaitTimingStats LiBox<KeyType, ValueType>::splitting_flag_wait_stats(1, "Segment splitting_flag");
