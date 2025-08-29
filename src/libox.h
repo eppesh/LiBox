@@ -155,6 +155,9 @@ struct SearchResult {
     ValueType value;
 };
 
+static constexpr int32_t BELOW_LOWER_BOUND = -1;
+static constexpr int32_t ABOVE_UPPER_BOUND = -2;
+
 template <typename KeyType, typename ValueType>
 class OverflowKeyValue {
    private:
@@ -933,6 +936,9 @@ private:
     double overflowThreshold;
     int thread_num;
 
+    std::unique_ptr<Box<KeyType, ValueType>> small_boundary_box_;
+    std::unique_ptr<Box<KeyType, ValueType>> big_boundary_box_;
+
     std::atomic<IndexStructure<KeyType, ValueType>*> index_structure_;
 
     std::atomic<bool> global_splitting_{false};
@@ -1158,6 +1164,44 @@ private:
         assert(splitting_segment_.load() == seg_index);
         splitting_segment_.store(-1, std::memory_order_release);
     }
+
+    InsertResult insertToBoundaryBox(KeyType key, ValueType value, int32_t box_type) {
+        auto& boundary_box = (box_type == BELOW_LOWER_BOUND) ? 
+                            small_boundary_box_ : big_boundary_box_;
+        if (!boundary_box) {
+            boundary_box = std::make_unique<Box<KeyType, ValueType>>();
+        }
+        InsertResult result = boundary_box->insertKeyValue(key, value);
+        if (result.status == InsertStatus::SUCCESS) {
+            size_t current_count = boundary_box->getTotalCount();
+            if (current_count >= maxKey) {
+                // Trigger upgrade to segment
+                cout << "Boundary box reached max capacity, consider upgrading to segment." << endl;
+                throw std::logic_error("Not implemented: upgradeBoundaryBoxToSegment");
+                // upgradeBoundaryBoxToSegment(box_type == BELOW_LOWER_BOUND);
+            }
+        }
+        return result;
+    }
+
+    SearchResult<KeyType, ValueType> searchInBoundaryBox(KeyType key, int32_t box_type) {
+        const std::unique_ptr<Box<KeyType, ValueType>>& boundary_box = 
+            (box_type == BELOW_LOWER_BOUND) ? small_boundary_box_ : big_boundary_box_;
+        if (!boundary_box) {
+            return {SearchStatus::NOT_FOUND, ValueType{}};
+        }
+        return boundary_box->searchKey(key);
+    }
+
+    DeleteResult deleteFromBoundaryBox(KeyType key, int32_t box_type) {
+        const std::unique_ptr<Box<KeyType, ValueType>>& boundary_box = 
+            (box_type == BELOW_LOWER_BOUND) ? small_boundary_box_ : big_boundary_box_;
+        if (!boundary_box) {
+            return {DeleteStatus::NOT_FOUND, false};
+        }
+        DeleteResult result = boundary_box->deleteKey(key);
+        return result;
+    }
 public:
     LiBox(double uThreshold, double oThreshold, int thread_num)
         : underflowThreshold(uThreshold),
@@ -1188,6 +1232,10 @@ public:
             EpochGuard guard(&ebr_);
             auto* structure = index_structure_.load(std::memory_order_acquire);
             seg_index = searchIndex(structure, key);
+            if (seg_index < 0) {
+                cout << "Inserting into boundary box for key: " << key << endl;
+                return insertToBoundaryBox(key, value, seg_index);
+            }
             if (index_structure_.load()->structure_id != structure->structure_id) {
                 exponential_backoff(retry_count++);
                 goto retry_insert;
@@ -1204,9 +1252,10 @@ public:
                 if (mark_segment_splitting(seg_index)) {
                     is_segment_splitting_.store(true, std::memory_order_release);
                     splitSegment(seg_index);
+                }else{                
+                    exponential_backoff(retry_count++);
+                    goto retry_insert;
                 }
-                exponential_backoff(retry_count++);
-                goto retry_insert;
             }
             // If multiple splits are happening, they need to be added to the queue, 
             // and the operations on that segment should be blocked immediately.
@@ -1229,6 +1278,10 @@ public:
     retry_delete:
         auto* structure = index_structure_.load(std::memory_order_acquire);        
         int32_t seg_index = searchIndex(structure, key);
+        if (seg_index < 0) {
+            cout << "Deleting from boundary box for key: " << key << endl;
+            return deleteFromBoundaryBox(key, seg_index);
+        }
         if (index_structure_.load()->structure_id != structure->structure_id) {
             exponential_backoff(retry_count++);
             goto retry_delete;
@@ -1250,6 +1303,10 @@ public:
     retry_search:
         auto* structure = index_structure_.load(std::memory_order_acquire);
         int32_t seg_index = searchIndex(structure, key);
+        if (seg_index < 0) {
+            cout << "Searching in boundary box for key: " << key << endl;
+            return searchInBoundaryBox(key, seg_index);
+        }
         if (index_structure_.load()->structure_id != structure->structure_id) {
             exponential_backoff(retry_count++);
             goto retry_search;
@@ -1278,6 +1335,7 @@ public:
     }
     
     void splitSegment(int32_t seg_index) {
+        auto start_time = std::chrono::high_resolution_clock::now();
         cout << "splitting segment " << seg_index << endl;
         if (!global_splitting_.exchange(true)) {
             auto* current = index_structure_.load();
@@ -1290,7 +1348,7 @@ public:
                 global_splitting_.store(false);
                 return;
             }
-            //
+
             vector<KeyType> keys;
             keys.reserve(mergedEntries.size());
             for (const auto& entry : mergedEntries) {
@@ -1313,10 +1371,9 @@ public:
             }
             
             populateSegmentsSerial(mergedEntries, new_segments);
-
-            atomicReplaceIndexStructure(seg_index, new_segments);
+            atomicReplaceIndexStructure(seg_index, new_segments, start_time);
             
-            delete segment;
+            delete segment; 
             is_segment_splitting_.store(false, std::memory_order_release);
             is_segment_splitting_.notify_all();
 
@@ -1358,10 +1415,10 @@ public:
         double a = structure->a;
         double b = structure->b;
         
-        if (key <= segment_start_keys.front()) {
-            return 0;
+        if (key < segment_start_keys.front()) {
+            return BELOW_LOWER_BOUND;
         } else if (key >= segment_start_keys.back()) {
-            return structure->segments.size() - 1;
+            return ABOVE_UPPER_BOUND;
         }
         
         int64_t position = static_cast<int64_t>(a * key + b);
@@ -1433,7 +1490,8 @@ public:
     }
 
     void atomicReplaceIndexStructure(int32_t old_seg_idx, 
-                                     std::vector<Segment<KeyType, ValueType>*> new_segments) {
+                                     std::vector<Segment<KeyType, ValueType>*> new_segments, 
+                                     std::chrono::high_resolution_clock::time_point start_time) {
         auto* current = index_structure_.load(std::memory_order_acquire);
         auto* new_structure = new IndexStructure<KeyType, ValueType>();
         
@@ -1457,6 +1515,10 @@ public:
         new_structure->version.store(0);
         
         auto* old = index_structure_.exchange(new_structure, std::memory_order_acq_rel);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        cout << "Total split time: " << total_duration.count() << " microseconds" << endl;
+
         ebr_.schedule_for_deletion(old);
     }
 
