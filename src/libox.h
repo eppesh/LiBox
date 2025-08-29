@@ -375,8 +375,16 @@ class OverflowKeyValue {
     }
 
     void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries) const {
+        size_t start_size = entries->size();
+        entries->resize(start_size + maxSize);
         for (size_t i = 0; i < maxSize; i++) {
-            entries->push_back({keys[i], values[i]});
+            (*entries)[start_size + i] = {keys[i], values[i]};
+        }
+    }
+
+    void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries, size_t start_pos) const {
+        for (size_t i = 0; i < maxSize; i++) {
+            (*entries)[start_pos + i] = {keys[i], values[i]};
         }
     }
 
@@ -857,11 +865,22 @@ class Box {
     }
 
     void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries) const {
+        size_t start_size = entries->size();
+        size_t total_entries = getTotalCount();
+
+        // Resize to accommodate all entries
+        entries->resize(start_size + total_entries);
+
+        // Assign main entries directly
         for (size_t i = 0; i < maxSize; i++) {
-            entries->push_back({keys[i], values[i]});
+            (*entries)[start_size + i] = {keys[i], values[i]};
         }
+
+        // Add overflow entries
+        size_t current_pos = start_size + maxSize;
         for (int i = 0; i < capacity; i++) {
-            data[i]->getEntriesInPlace(entries);
+            data[i]->getEntriesInPlace(entries, current_pos);
+            current_pos += data[i]->size();
         }
     }
 
@@ -1598,6 +1617,8 @@ public:
             }
             auto t8 = std::chrono::high_resolution_clock::now();
 
+            size_t new_segments_size = new_segments.size();
+
             populateSegmentsSerial(mergedEntries, new_segments);
             auto t9 = std::chrono::high_resolution_clock::now();
 
@@ -1645,6 +1666,7 @@ public:
                       << "cleanup=" << duration10 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration10 * 100.0 / total_time_us) : 0.0) << "%), "
                       << "unmark=" << duration11 << " (" << std::fixed << std::setprecision(1) << (total_time_us > 0 ? (duration11 * 100.0 / total_time_us) : 0.0) << "%)"
                       << " | mergedEntries_size=" << merged_entries_size
+                      << " | new_segments_size=" << new_segments_size
                       << " | normalized_per_100k=" << std::fixed << std::setprecision(2) << normalized_time_per_100k << "us" << std::endl;
         }
 
