@@ -11,6 +11,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <future>
@@ -884,6 +885,21 @@ class Box {
         }
     }
 
+    void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries, size_t start_pos) const {
+        // Don't resize - assume the vector is already large enough
+        // Assign main entries directly
+        for (size_t i = 0; i < maxSize; i++) {
+            (*entries)[start_pos + i] = {keys[i], values[i]};
+        }
+
+        // Add overflow entries
+        size_t current_pos = start_pos + maxSize;
+        for (int i = 0; i < capacity; i++) {
+            data[i]->getEntriesInPlace(entries, current_pos);
+            current_pos += data[i]->size();
+        }
+    }
+
     size_t getOverflowBoxCount() const {
         size_t cap;
         size_t first_overflow_size;
@@ -908,6 +924,7 @@ private:
     KeyType upper_bound;
     size_t box_key_range;
     int numBoxes;
+    size_t num_threads;
 
     mutable ThreadLocalCounter operation_counter_;
     mutable std::atomic<bool> splitting_{false};
@@ -917,7 +934,7 @@ public:
 
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
-          operation_counter_(thread_num) {
+          operation_counter_(thread_num), num_threads(thread_num) {
         size_t total = upper - lower + 1;
         size_t box_count = total / box_range;
         if (total % box_range != 0) box_count++;
@@ -1023,28 +1040,62 @@ public:
     vector<pair<KeyType, ValueType>> prepare_for_split_stage1() {
         // Pre-calculate total size to avoid reallocations
         size_t total_size = 0;
-        for (const auto& box : boxes) {
-            total_size += box.getTotalCount();
-        }
-
         vector<pair<KeyType, ValueType>> mergedEntries;
-        mergedEntries.reserve(total_size);
 
-        // Collect entries from boxes and sort incrementally
+        // Pre-calculate positions for each box to avoid atomic operations
+        std::vector<size_t> box_start_positions(boxes.size() + 1, 0);
         for (int i = 0; i < static_cast<int>(boxes.size()); i++) {
-            size_t start_size = mergedEntries.size();
-            boxes[i].getEntriesInPlace(&mergedEntries);
-            size_t end_size = mergedEntries.size();
+            size_t box_size = boxes[i].getTotalCount();
+            box_start_positions[i + 1] = box_start_positions[i] + box_size;
+            total_size += box_size;
+        }
+        mergedEntries.resize(total_size);
+
+        // Create explicit thread pool to avoid OpenMP nested parallel region issues
+        std::vector<std::thread> threads;
+        int thread_count = 4; // num_threads / 2;
+        int num_boxes = static_cast<int>(boxes.size());
+        int boxes_per_thread = num_boxes / thread_count;
+        int remaining_boxes = num_boxes % thread_count;
+
+        auto process_boxes = [&](int thread_id, int start_box, int end_box) {
+            for (int i = start_box; i < end_box; i++) {
+                // Get entries directly into the pre-allocated position in mergedEntries
+                size_t start_pos = box_start_positions[i];
+                boxes[i].getEntriesInPlace(&mergedEntries, start_pos);
 
 #ifdef SORT_BOX
-            // Sort only the newly added entries from this box
-            if (end_size > start_size) {
-                std::sort(mergedEntries.begin() + start_size, mergedEntries.end(),
-                    [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
-                        return a.first < b.first;
-                    });
-            }
+                // Sort the box's entries in place
+                size_t end_pos = box_start_positions[i + 1];
+                if (end_pos > start_pos) {
+                    std::sort(mergedEntries.begin() + start_pos, mergedEntries.begin() + end_pos,
+                        [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
+                            return a.first < b.first;
+                        });
+                }
 #endif
+            }
+        };
+
+        // Launch threads with work distribution
+        int current_box = 0;
+        for (int t = 0; t < thread_count; t++) {
+            int thread_boxes = boxes_per_thread + (t < remaining_boxes ? 1 : 0);
+            int start_box = current_box;
+            int end_box = current_box + thread_boxes;
+
+            if (thread_count == 1) {
+                process_boxes(t, start_box, end_box);
+                break;
+            } else {
+                threads.emplace_back(process_boxes, t, start_box, end_box);
+            }
+            current_box = end_box;
+        }
+
+        // Wait for all threads to complete
+        for (auto& thread : threads) {
+            thread.join();
         }
 
 #ifndef SORT_BOX
@@ -1165,6 +1216,7 @@ private:
     static std::atomic<uint64_t> total_split_operations_;
     static std::atomic<uint64_t> total_entries_processed_;
     static std::atomic<uint64_t> total_segments_created_;
+    static std::atomic<uint64_t> total_merged_entries_size_;
 
     static void initializeTimingStats(int thread_num) {
         // Re-initialize the static timing stats with the correct thread count
@@ -1685,6 +1737,7 @@ public:
             // Accumulate other statistics
             total_split_operations_.fetch_add(1, std::memory_order_relaxed);
             total_entries_processed_.fetch_add(merged_entries_size, std::memory_order_relaxed);
+        total_merged_entries_size_.fetch_add(merged_entries_size, std::memory_order_relaxed);
             total_segments_created_.fetch_add(new_segments_size, std::memory_order_relaxed);
         }
 
@@ -1957,6 +2010,7 @@ public:
 
         uint64_t total_entries = total_entries_processed_.load(std::memory_order_relaxed);
         uint64_t total_segments = total_segments_created_.load(std::memory_order_relaxed);
+        uint64_t total_merged_entries = total_merged_entries_size_.load(std::memory_order_relaxed);
 
         uint64_t total_time = load_time + wait_time + prepare_time + keys_time + calculate_time +
                              toStruct_time + create_time + populate_time + replace_time + cleanup_time + unmark_time;
@@ -1965,25 +2019,28 @@ public:
         std::cout << "Total operations: " << total_ops << std::endl;
         std::cout << "Total entries processed: " << total_entries << std::endl;
         std::cout << "Total segments created: " << total_segments << std::endl;
+        std::cout << "Total mergedEntries size: " << total_merged_entries << std::endl;
         std::cout << "Total time: " << total_time << "us" << std::endl;
         std::cout << "Average time per operation: " << (total_time / total_ops) << "us" << std::endl;
         std::cout << "Average entries per operation: " << (total_entries / total_ops) << std::endl;
         std::cout << "Average segments per operation: " << (total_segments / total_ops) << std::endl;
         std::cout << "Overall throughput: " << std::fixed << std::setprecision(2)
                   << (total_time > 0 ? (total_entries * 1000000.0 / total_time) : 0.0) << " entries/sec" << std::endl;
+        std::cout << "Normalized time per mergedEntry: " << std::fixed << std::setprecision(3)
+                  << (total_merged_entries > 0 ? (static_cast<double>(total_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
 
         std::cout << "\nPhase breakdown (accumulated):" << std::endl;
-        std::cout << "  load: " << load_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (load_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  wait: " << wait_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (wait_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  prepare: " << prepare_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (prepare_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  keys: " << keys_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (keys_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  calculate: " << calculate_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (calculate_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  toStruct: " << toStruct_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (toStruct_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  create: " << create_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (create_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  populate: " << populate_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (populate_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  replace: " << replace_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (replace_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  cleanup: " << cleanup_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (cleanup_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
-        std::cout << "  unmark: " << unmark_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (unmark_time * 100.0 / total_time) : 0.0) << "%)" << std::endl;
+        std::cout << "  load: " << load_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (load_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(load_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  wait: " << wait_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (wait_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(wait_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  prepare: " << prepare_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (prepare_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(prepare_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  keys: " << keys_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (keys_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(keys_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  calculate: " << calculate_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (calculate_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(calculate_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  toStruct: " << toStruct_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (toStruct_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(toStruct_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  create: " << create_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (create_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(create_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  populate: " << populate_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (populate_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(populate_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  replace: " << replace_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (replace_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(replace_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  cleanup: " << cleanup_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (cleanup_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(cleanup_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  unmark: " << unmark_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (unmark_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(unmark_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
         std::cout << "==========================================\n" << std::endl;
     }
 };
@@ -2046,6 +2103,9 @@ public:
 
     template <typename KeyType, typename ValueType>
     std::atomic<uint64_t> LiBox<KeyType, ValueType>::total_segments_created_{0};
+
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::total_merged_entries_size_{0};
 
     //template <typename KeyType, typename ValueType>
     //ThreadLocalWaitTimingStats LiBox<KeyType, ValueType>::splitting_flag_wait_stats(1, "Segment splitting_flag");
