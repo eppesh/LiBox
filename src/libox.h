@@ -1636,6 +1636,7 @@ public:
         if (!global_splitting_.exchange(true)) {
             auto* current = index_structure_.load();
             auto* segment = current->segments[seg_index];
+            cout << "num boxes: " << segment->boxes.size() << endl;
             auto t2 = std::chrono::high_resolution_clock::now();
 
             auto wait_start = std::chrono::high_resolution_clock::now();

@@ -1,8 +1,12 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <cstdlib>
 
 #include "segmentation.h"
+
+// max val w/o overflow
+size_t MAX_KEYS_IN_SEGMENT = INT64_MAX;
 
 using namespace liboxns;
 
@@ -79,10 +83,20 @@ void process_data(std::vector<KeyType>& data) {
 int main(int argc, char* argv[]) {
     // Modify the 'KeyType' as needed
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input_file> <output_file>" << std::endl;
-        std::cerr << "E.g.: ./partition_optimization w106.csv optimized_segments_w106.csv"
-                  << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input_file> <output_file> [max_box_in_segment]" << std::endl;
+        std::cerr << "E.g.: ./partition_optimization w106.csv optimized_segments_w106.csv 50000" << std::endl;
+        std::cerr << "      ./partition_optimization w106.csv optimized_segments_w106.csv" << std::endl;
+        std::cerr << "      (default max_box_in_segment = 50000)" << std::endl;
         return -1;
+    }
+
+    // Parse optional max_box_in_segment parameter
+    if (argc >= 4) {
+        size_t max_box_in_segment = std::stoul(argv[3]);
+        MAX_KEYS_IN_SEGMENT = size_t(max_box_in_segment * BOX_CAPACITY);
+        std::cout << "Setting MAX_BOX_IN_SEGMENT to: " << max_box_in_segment << std::endl;
+    } else {
+        std::cout << "Using default MAX_BOX_IN_SEGMENT " << std::endl;
     }
     std::cout << "Size of current KeyType is " << sizeof(KeyType) << std::endl;
     string input_file = argv[1];
@@ -114,7 +128,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Finished creating segments: segment count=" << final_segments.size() << std::endl;
     if (!final_segments.empty()) {
         std::cout << "last segment: lower=" << final_segments.back().seg_lower
-                  << "; upper=" << final_segments.back().seg_upper 
+                  << "; upper=" << final_segments.back().seg_upper
                   << "; range=" << final_segments.back().box_range << std::endl;
     }
 

@@ -12,6 +12,8 @@
 #include "libox_utils.h"
 using namespace liboxns;
 
+extern size_t MAX_KEYS_IN_SEGMENT;
+
 namespace seg {
 template <typename KeyType>
 struct keySegment {
@@ -99,6 +101,10 @@ keySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
 
         size_t num_keys = new_end_idx - seg.end_idx;
         if (num_keys >= BOX_CAPACITY * 2) {
+            break;
+        }
+
+        if (seg.cum_keys + num_keys > MAX_KEYS_IN_SEGMENT) {
             break;
         }
 

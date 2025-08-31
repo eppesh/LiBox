@@ -30,6 +30,9 @@
 
 #include "../src/libox.h"
 
+// max val w/o overflow
+size_t MAX_KEYS_IN_SEGMENT = INT64_MAX;
+
 using namespace std;
 
 using FlagMap = unordered_map<string, string>;
