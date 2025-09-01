@@ -1003,6 +1003,8 @@ public:
 
         size_t box_index = (key - lower_bound) / box_key_range;
         InsertResult ret = boxes[box_index].insertKeyValue(key, value);
+        // ensure overflowing box index propagates up
+        ret.box_index = static_cast<int>(box_index);
         leave();
         return ret;
     }
@@ -1037,86 +1039,37 @@ public:
         return result;
     }
 
-    vector<pair<KeyType, ValueType>> prepare_for_split_stage1() {
+    vector<pair<KeyType, ValueType>> prepare_for_split_stage1(int32_t merge_start, int32_t merge_end) {
         // Pre-calculate total size to avoid reallocations
         size_t total_size = 0;
         vector<pair<KeyType, ValueType>> mergedEntries;
 
-        // Pre-calculate positions for each box to avoid atomic operations
-        std::vector<size_t> box_start_positions(boxes.size() + 1, 0);
-        for (int i = 0; i < static_cast<int>(boxes.size()); i++) {
+        // Pre-calculate positions for each selected box
+        int32_t start_box = std::max(0, merge_start);
+        int32_t end_box = std::min(merge_end, static_cast<int32_t>(boxes.size()) - 1);
+        if (start_box > end_box) return mergedEntries;
+
+        std::vector<size_t> box_start_positions(static_cast<size_t>(end_box - start_box + 2), 0);
+        for (int i = start_box; i <= end_box; i++) {
             size_t box_size = boxes[i].getTotalCount();
-            box_start_positions[i + 1] = box_start_positions[i] + box_size;
+            box_start_positions[(i - start_box) + 1] = box_start_positions[(i - start_box)] + box_size;
             total_size += box_size;
         }
         mergedEntries.resize(total_size);
 
-        // Create explicit thread pool to avoid OpenMP nested parallel region issues
-        std::vector<std::thread> threads;
-        int thread_count = 4; // num_threads / 2;
-        int num_boxes = static_cast<int>(boxes.size());
-        int boxes_per_thread = num_boxes / thread_count;
-        int remaining_boxes = num_boxes % thread_count;
-
-        auto process_boxes = [&](int thread_id, int start_box, int end_box) {
-            for (int i = start_box; i < end_box; i++) {
-                // Get entries directly into the pre-allocated position in mergedEntries
-                size_t start_pos = box_start_positions[i];
-                boxes[i].getEntriesInPlace(&mergedEntries, start_pos);
-
+        for (int i = start_box; i <= end_box; i++) {
+            size_t start_pos = box_start_positions[i - start_box];
+            boxes[i].getEntriesInPlace(&mergedEntries, start_pos);
 #ifdef SORT_BOX
-                // Sort the box's entries in place
-                size_t end_pos = box_start_positions[i + 1];
-                if (end_pos > start_pos) {
-                    std::sort(mergedEntries.begin() + start_pos, mergedEntries.begin() + end_pos,
-                        [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
-                            return a.first < b.first;
-                        });
-                }
+            size_t end_pos = box_start_positions[(i - start_box) + 1];
+            if (end_pos > start_pos) {
+                std::sort(mergedEntries.begin() + start_pos, mergedEntries.begin() + end_pos,
+                    [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
+                        return a.first < b.first;
+                    });
+            }
 #endif
-            }
-        };
-
-        // Launch threads with work distribution
-        int current_box = 0;
-        for (int t = 0; t < thread_count; t++) {
-            int thread_boxes = boxes_per_thread + (t < remaining_boxes ? 1 : 0);
-            int start_box = current_box;
-            int end_box = current_box + thread_boxes;
-
-            if (thread_count == 1) {
-                process_boxes(t, start_box, end_box);
-                break;
-            } else {
-                threads.emplace_back(process_boxes, t, start_box, end_box);
-            }
-            current_box = end_box;
         }
-
-        // Wait for all threads to complete
-        for (auto& thread : threads) {
-            thread.join();
-        }
-
-#ifndef SORT_BOX
-        // Sort the merged entries
-        std::sort(mergedEntries.begin(), mergedEntries.end(),
-            [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
-                return a.first < b.first;
-            });
-#endif
-
-        // Debug check
-        #ifndef NDEBUG
-        for (size_t i = 1; i < mergedEntries.size(); i++) {
-            if (mergedEntries[i].first < mergedEntries[i - 1].first) {
-                std::cerr << "Merged entry " << i << " is not sorted!" << std::endl;
-                std::cerr << "Merged entry " << i << " is " << mergedEntries[i].first << " " << mergedEntries[i].second << std::endl;
-                std::cerr << "Merged entry " << i - 1 << " is " << mergedEntries[i - 1].first << " " << mergedEntries[i - 1].second << std::endl;
-                std::cerr << "Merged entries are not sorted!" << std::endl;
-            }
-        }
-        #endif
 
         return mergedEntries;
     }
@@ -1533,7 +1486,7 @@ public:
             if (!is_segment_splitting(seg_index) && splitting_segment_.load(std::memory_order_acquire) == -1) {
                 if (mark_segment_splitting(seg_index)) {
                     is_segment_splitting_.store(true, std::memory_order_release);
-                    splitSegment(seg_index);
+                    splitSegment(seg_index, result.box_index);
                 }else{
                     exponential_backoff(retry_count++);
                     goto retry_insert;
@@ -1628,9 +1581,9 @@ public:
         }
     }
 
-    void splitSegment(int32_t seg_index) {
+    void splitSegment(int32_t seg_index, int box_index) {
         auto split_start = std::chrono::high_resolution_clock::now();
-        cout << "splitting segment " << seg_index << endl;
+        cout << "splitting segment " << seg_index << " due to overflow in box " << box_index << endl;
 
         auto t1 = std::chrono::high_resolution_clock::now();
         if (!global_splitting_.exchange(true)) {
@@ -1646,7 +1599,14 @@ public:
             wait_for_operations_stats_.record_wait(wait_duration);
             auto t3 = std::chrono::high_resolution_clock::now();
 
-            auto mergedEntries = segment->prepare_for_split_stage1();
+            // Calculate the range of boxes to process like small-split-libox.h
+            int left_count = 3;
+            int right_count = 3;
+            size_t numBoxes = segment->getBoxCount();
+            int merge_start = std::max(0, box_index - left_count);
+            int merge_end = std::min(static_cast<int>(numBoxes) - 1, box_index + right_count);
+
+            auto mergedEntries = segment->prepare_for_split_stage1(merge_start, merge_end);
             auto t4 = std::chrono::high_resolution_clock::now();
 
             size_t merged_entries_size = mergedEntries.size();
@@ -1666,15 +1626,41 @@ public:
             }
             auto t5 = std::chrono::high_resolution_clock::now();
 
+            KeyType merged_lower = segment->getBoxLower(merge_start);
+            KeyType merged_upper = segment->getBoxUpper(merge_end);
+
             std::vector<keySegment<KeyType>> keysegments =
-                calculateSegments(keys, overflowThreshold, underflowThreshold, 15, segment->getLowerBound() , segment->getUpperBound());
+                calculateSegments(keys, overflowThreshold, underflowThreshold, 15, merged_lower, merged_upper);
             auto t6 = std::chrono::high_resolution_clock::now();
 
             std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
             auto t7 = std::chrono::high_resolution_clock::now();
 
             std::vector<Segment<KeyType, ValueType>*> new_segments;
-            new_segments.reserve(final_segments.size());
+            std::vector<KeyType> new_segment_start_keys;
+
+            // Create left segment if there are boxes before the merge range
+            if (merge_start > 0) {
+                KeyType left_lower = segment->getLowerBound();
+                KeyType left_upper = segment->getBoxUpper(merge_start - 1);
+                auto* left_segment = new Segment<KeyType, ValueType>(
+                    left_lower, left_upper, segment->getBoxKeyRange(), thread_num
+                );
+
+                // Copy boxes directly from the original segment to the left segment
+                left_segment->boxes.clear();
+                left_segment->boxes.reserve(merge_start);
+                for (int i = 0; i < merge_start; i++) {
+                    left_segment->boxes.push_back(segment->boxes[i]);
+                }
+
+                new_segments.push_back(left_segment);
+                new_segment_start_keys.push_back(left_lower);
+            }
+
+            // Process the merged entries to create new segments
+            std::vector<Segment<KeyType, ValueType>*> merged_segments;
+            merged_segments.reserve(final_segments.size());
             for (const auto& struct_seg : final_segments) {
                 auto* new_seg = new Segment<KeyType, ValueType>(
                     struct_seg.seg_lower,
@@ -1682,13 +1668,36 @@ public:
                     struct_seg.box_range,
                     thread_num
                 );
+                merged_segments.push_back(new_seg);
                 new_segments.push_back(new_seg);
+                new_segment_start_keys.push_back(struct_seg.seg_lower);
             }
             auto t8 = std::chrono::high_resolution_clock::now();
 
             size_t new_segments_size = new_segments.size();
 
-            populateSegmentsSerial(mergedEntries, new_segments);
+            // Populate only the merged segments (not left/right segments)
+            populateSegmentsSerial(mergedEntries, merged_segments);
+
+            // Create right segment if there are boxes after the merge range
+            if (merge_end < static_cast<int>(numBoxes) - 1) {
+                KeyType right_lower = segment->getBoxLower(merge_end + 1);
+                KeyType right_upper = segment->getUpperBound();
+                auto* right_segment = new Segment<KeyType, ValueType>(
+                    right_lower, right_upper, segment->getBoxKeyRange(), thread_num
+                );
+
+                // Copy boxes directly from the original segment to the right segment
+                right_segment->boxes.clear();
+                int right_box_count = numBoxes - (merge_end + 1);
+                right_segment->boxes.reserve(right_box_count);
+                for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
+                    right_segment->boxes.push_back(segment->boxes[i]);
+                }
+
+                new_segments.push_back(right_segment);
+                new_segment_start_keys.push_back(right_lower);
+            }
             auto t9 = std::chrono::high_resolution_clock::now();
 
             atomicReplaceIndexStructure(seg_index, new_segments, split_start);
