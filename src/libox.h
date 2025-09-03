@@ -48,6 +48,8 @@
 #define overflowCapacity 3
 #define maxKey 64
 
+#define NUM_BOXES_TO_LOOK 3
+
 volatile int dummy;
 using namespace std;
 
@@ -1600,8 +1602,8 @@ public:
             auto t3 = std::chrono::high_resolution_clock::now();
 
             // Calculate the range of boxes to process like small-split-libox.h
-            int left_count = 3;
-            int right_count = 3;
+            int left_count = NUM_BOXES_TO_LOOK;
+            int right_count = NUM_BOXES_TO_LOOK;
             size_t numBoxes = segment->getBoxCount();
             int merge_start = std::max(0, box_index - left_count);
             int merge_end = std::min(static_cast<int>(numBoxes) - 1, box_index + right_count);
@@ -1634,7 +1636,7 @@ public:
             auto t6 = std::chrono::high_resolution_clock::now();
 
             std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
-            auto t7 = std::chrono::high_resolution_clock::now();
+            auto t7 = std::chrono::high_resolution_clock::now(); // create phase
 
             std::vector<Segment<KeyType, ValueType>*> new_segments;
             std::vector<KeyType> new_segment_start_keys;
@@ -1672,7 +1674,7 @@ public:
                 new_segments.push_back(new_seg);
                 new_segment_start_keys.push_back(struct_seg.seg_lower);
             }
-            auto t8 = std::chrono::high_resolution_clock::now();
+            auto t8 = std::chrono::high_resolution_clock::now(); // populate phase
 
             size_t new_segments_size = new_segments.size();
 
