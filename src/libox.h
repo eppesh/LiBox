@@ -1168,6 +1168,8 @@ private:
     static std::atomic<uint64_t> accumulated_replace_time_us_;
     static std::atomic<uint64_t> accumulated_cleanup_time_us_;
     static std::atomic<uint64_t> accumulated_unmark_time_us_;
+    static std::atomic<uint64_t> accumulated_left_seg_time_us_;
+    static std::atomic<uint64_t> accumulated_right_seg_time_us_;
     static std::atomic<uint64_t> total_split_operations_;
     static std::atomic<uint64_t> total_entries_processed_;
     static std::atomic<uint64_t> total_segments_created_;
@@ -1641,8 +1643,14 @@ public:
             std::vector<Segment<KeyType, ValueType>*> new_segments;
             std::vector<KeyType> new_segment_start_keys;
 
+            // Declare timing variables at function scope
+            std::chrono::high_resolution_clock::time_point t_left_start, t_left_end;
+            std::chrono::high_resolution_clock::time_point t_right_start, t_right_end;
+
             // Create left segment if there are boxes before the merge range
+            t_left_start = std::chrono::high_resolution_clock::now(); // left_seg phase start
             if (merge_start > 0) {
+
                 KeyType left_lower = segment->getLowerBound();
                 KeyType left_upper = segment->getBoxUpper(merge_start - 1);
                 auto* left_segment = new Segment<KeyType, ValueType>(
@@ -1658,7 +1666,9 @@ public:
 
                 new_segments.push_back(left_segment);
                 new_segment_start_keys.push_back(left_lower);
+
             }
+            t_left_end = std::chrono::high_resolution_clock::now(); // left_seg phase end
 
             // Process the merged entries to create new segments
             std::vector<Segment<KeyType, ValueType>*> merged_segments;
@@ -1683,6 +1693,8 @@ public:
 
             // Create right segment if there are boxes after the merge range
             if (merge_end < static_cast<int>(numBoxes) - 1) {
+                t_right_start = std::chrono::high_resolution_clock::now(); // right_seg phase start
+
                 KeyType right_lower = segment->getBoxLower(merge_end + 1);
                 KeyType right_upper = segment->getUpperBound();
                 auto* right_segment = new Segment<KeyType, ValueType>(
@@ -1699,6 +1711,8 @@ public:
 
                 new_segments.push_back(right_segment);
                 new_segment_start_keys.push_back(right_lower);
+
+                t_right_end = std::chrono::high_resolution_clock::now(); // right_seg phase end
             }
             auto t9 = std::chrono::high_resolution_clock::now();
 
@@ -1715,21 +1729,27 @@ public:
             auto t12 = std::chrono::high_resolution_clock::now();
 
             // Calculate timing breakdown
+            // Calculate left and right segment timing
+            auto duration_left_seg = std::chrono::duration_cast<std::chrono::microseconds>(t_left_end - t_left_start).count();
+            auto duration_right_seg = std::chrono::duration_cast<std::chrono::microseconds>(t_right_end - t_right_start).count();
             auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
             auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
             auto duration3 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
             auto duration4 = std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count();
             auto duration5 = std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
             auto duration6 = std::chrono::duration_cast<std::chrono::microseconds>(t7 - t6).count();
-            auto duration7 = std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
-            auto duration8 = std::chrono::duration_cast<std::chrono::microseconds>(t9 - t8).count();
+            auto duration7 = std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count()
+                - duration_left_seg;
+            auto duration8 = std::chrono::duration_cast<std::chrono::microseconds>(t9 - t8).count()
+                - duration_right_seg;
             auto duration9 = std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
             auto duration10 = std::chrono::duration_cast<std::chrono::microseconds>(t11 - t10).count();
             auto duration11 = std::chrono::duration_cast<std::chrono::microseconds>(t12 - t11).count();
 
             // Calculate total time and normalized time per 100k entries
             auto total_time_us = duration1 + duration2 + duration3 + duration4 + duration5 +
-                                duration6 + duration7 + duration8 + duration9 + duration10 + duration11;
+                                duration6 + duration7 + duration8 + duration9 + duration10 + duration11 +
+                                duration_left_seg + duration_right_seg;
             double normalized_time_per_100k = (merged_entries_size > 0) ?
                 (static_cast<double>(total_time_us) * 100000.0 / merged_entries_size) : 0.0;
 
@@ -1745,6 +1765,8 @@ public:
             accumulated_replace_time_us_.fetch_add(duration9, std::memory_order_relaxed);
             accumulated_cleanup_time_us_.fetch_add(duration10, std::memory_order_relaxed);
             accumulated_unmark_time_us_.fetch_add(duration11, std::memory_order_relaxed);
+            accumulated_left_seg_time_us_.fetch_add(duration_left_seg, std::memory_order_relaxed);
+            accumulated_right_seg_time_us_.fetch_add(duration_right_seg, std::memory_order_relaxed);
 
             // Accumulate other statistics
             total_split_operations_.fetch_add(1, std::memory_order_relaxed);
@@ -2019,13 +2041,16 @@ public:
         uint64_t replace_time = accumulated_replace_time_us_.load(std::memory_order_relaxed);
         uint64_t cleanup_time = accumulated_cleanup_time_us_.load(std::memory_order_relaxed);
         uint64_t unmark_time = accumulated_unmark_time_us_.load(std::memory_order_relaxed);
+        uint64_t left_seg_time = accumulated_left_seg_time_us_.load(std::memory_order_relaxed);
+        uint64_t right_seg_time = accumulated_right_seg_time_us_.load(std::memory_order_relaxed);
 
         uint64_t total_entries = total_entries_processed_.load(std::memory_order_relaxed);
         uint64_t total_segments = total_segments_created_.load(std::memory_order_relaxed);
         uint64_t total_merged_entries = total_merged_entries_size_.load(std::memory_order_relaxed);
 
         uint64_t total_time = load_time + wait_time + prepare_time + keys_time + calculate_time +
-                             toStruct_time + create_time + populate_time + replace_time + cleanup_time + unmark_time;
+                             toStruct_time + create_time + populate_time + replace_time + cleanup_time + unmark_time +
+                             left_seg_time + right_seg_time;
 
         std::cout << "\n=== Accumulated SplitSegment Statistics ===" << std::endl;
         std::cout << "Total operations: " << total_ops << std::endl;
@@ -2053,6 +2078,8 @@ public:
         std::cout << "  replace: " << replace_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (replace_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(replace_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
         std::cout << "  cleanup: " << cleanup_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (cleanup_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(cleanup_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
         std::cout << "  unmark: " << unmark_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (unmark_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(unmark_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  left_seg: " << left_seg_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (left_seg_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(left_seg_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
+        std::cout << "  right_seg: " << right_seg_time << "us (" << std::fixed << std::setprecision(1) << (total_time > 0 ? (right_seg_time * 100.0 / total_time) : 0.0) << "%) - " << std::fixed << std::setprecision(3) << (total_merged_entries > 0 ? (static_cast<double>(right_seg_time) * 1000.0 / total_merged_entries) : 0.0) << "ns per entry" << std::endl;
         std::cout << "==========================================\n" << std::endl;
     }
 };
@@ -2106,6 +2133,10 @@ public:
 
     template <typename KeyType, typename ValueType>
     std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_unmark_time_us_{0};
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_left_seg_time_us_{0};
+    template <typename KeyType, typename ValueType>
+    std::atomic<uint64_t> LiBox<KeyType, ValueType>::accumulated_right_seg_time_us_{0};
 
     template <typename KeyType, typename ValueType>
     std::atomic<uint64_t> LiBox<KeyType, ValueType>::total_split_operations_{0};
