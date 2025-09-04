@@ -932,7 +932,7 @@ private:
     mutable std::atomic<bool> splitting_{false};
     std::atomic_flag splitting_flag_ = ATOMIC_FLAG_INIT;
 public:
-    std::vector<std::shared_ptr<Box<KeyType, ValueType>>> boxes;
+    std::vector<Box<KeyType, ValueType>*> boxes;
 
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
@@ -943,7 +943,15 @@ public:
         numBoxes = box_count;
         boxes.resize(box_count);
         for (size_t i = 0; i < box_count; i++) {
-            boxes[i] = std::make_shared<Box<KeyType, ValueType>>();
+            boxes[i] = new Box<KeyType, ValueType>();
+        }
+    }
+
+    ~Segment() {
+        for (auto* box : boxes) {
+            if (box != nullptr) {
+                delete box;
+            }
         }
     }
 
@@ -1116,9 +1124,11 @@ public:
 
     vector<pair<KeyType, ValueType>> getAllEntries() const {
         vector<pair<KeyType, ValueType>> entries;
-        for (const auto& box : boxes) {
-            vector<pair<KeyType, ValueType>> be = box.getEntries();
-            entries.insert(entries.end(), be.begin(), be.end());
+        for (const auto* box : boxes) {
+            if (box != nullptr) {
+                vector<pair<KeyType, ValueType>> be = box->getEntries();
+                entries.insert(entries.end(), be.begin(), be.end());
+            }
         }
         return entries;
     }
@@ -1661,11 +1671,8 @@ public:
                 );
 
                 // Copy box pointers directly from the original segment to the left segment
-                left_segment->boxes.clear();
-                left_segment->boxes.reserve(merge_start);
-                for (int i = 0; i < merge_start; i++) {
-                    left_segment->boxes.push_back(segment->boxes[i]);
-                }
+                left_segment->boxes.resize(merge_start);
+                std::copy(segment->boxes.begin(), segment->boxes.begin() + merge_start, left_segment->boxes.begin());
 
                 new_segments.push_back(left_segment);
                 new_segment_start_keys.push_back(left_lower);
@@ -1705,12 +1712,9 @@ public:
                 );
 
                 // Copy box pointers directly from the original segment to the right segment
-                right_segment->boxes.clear();
                 int right_box_count = numBoxes - (merge_end + 1);
-                right_segment->boxes.reserve(right_box_count);
-                for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
-                    right_segment->boxes.push_back(segment->boxes[i]);
-                }
+                right_segment->boxes.resize(right_box_count);
+                std::copy(segment->boxes.begin() + merge_end + 1, segment->boxes.end(), right_segment->boxes.begin());
 
                 new_segments.push_back(right_segment);
                 new_segment_start_keys.push_back(right_lower);
@@ -1722,6 +1726,14 @@ public:
             atomicReplaceIndexStructure(seg_index, new_segments, split_start);
             auto t10 = std::chrono::high_resolution_clock::now();
 
+            // Set pointers to nullptr for boxes that are now owned by left_segment and right_segment
+            // to avoid double-free in the destructor
+            for (int i = 0; i < merge_start; i++) {
+                segment->boxes[i] = nullptr;
+            }
+            for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
+                segment->boxes[i] = nullptr;
+            }
             delete segment;
             is_segment_splitting_.store(false, std::memory_order_release);
             is_segment_splitting_.notify_all();
