@@ -932,7 +932,7 @@ private:
     mutable std::atomic<bool> splitting_{false};
     std::atomic_flag splitting_flag_ = ATOMIC_FLAG_INIT;
 public:
-    std::vector<Box<KeyType, ValueType>> boxes;
+    std::vector<std::shared_ptr<Box<KeyType, ValueType>>> boxes;
 
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
@@ -942,6 +942,9 @@ public:
         if (total % box_range != 0) box_count++;
         numBoxes = box_count;
         boxes.resize(box_count);
+        for (size_t i = 0; i < box_count; i++) {
+            boxes[i] = std::make_shared<Box<KeyType, ValueType>>();
+        }
     }
 
     Segment(const Segment&) = delete;
@@ -1004,7 +1007,7 @@ public:
         }
 
         size_t box_index = (key - lower_bound) / box_key_range;
-        InsertResult ret = boxes[box_index].insertKeyValue(key, value);
+        InsertResult ret = boxes[box_index]->insertKeyValue(key, value);
         // ensure overflowing box index propagates up
         ret.box_index = static_cast<int>(box_index);
         leave();
@@ -1021,7 +1024,7 @@ public:
         }
 
         size_t box_index = (key - lower_bound) / box_key_range;
-        DeleteResult result = boxes[box_index].deleteKey(key);
+        DeleteResult result = boxes[box_index]->deleteKey(key);
         leave();
         return result;
     }
@@ -1036,7 +1039,7 @@ public:
         }
 
         size_t box_index = (key - lower_bound) / box_key_range;
-        SearchResult result = boxes[box_index].searchKey(key);
+        SearchResult result = boxes[box_index]->searchKey(key);
         //leave();
         return result;
     }
@@ -1053,7 +1056,7 @@ public:
 
         std::vector<size_t> box_start_positions(static_cast<size_t>(end_box - start_box + 2), 0);
         for (int i = start_box; i <= end_box; i++) {
-            size_t box_size = boxes[i].getTotalCount();
+            size_t box_size = boxes[i]->getTotalCount();
             box_start_positions[(i - start_box) + 1] = box_start_positions[(i - start_box)] + box_size;
             total_size += box_size;
         }
@@ -1061,7 +1064,7 @@ public:
 
         for (int i = start_box; i <= end_box; i++) {
             size_t start_pos = box_start_positions[i - start_box];
-            boxes[i].getEntriesInPlace(&mergedEntries, start_pos);
+            boxes[i]->getEntriesInPlace(&mergedEntries, start_pos);
 #ifdef SORT_BOX
             size_t end_pos = box_start_positions[(i - start_box) + 1];
             if (end_pos > start_pos) {
@@ -1081,7 +1084,7 @@ public:
         int safe_start = std::max(0, start_box);
         int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
         for (int i = safe_start; i <= safe_end; i++) {
-            auto box_entries = boxes[i].getEntries();
+            auto box_entries = boxes[i]->getEntries();
             entries.insert(entries.end(), box_entries.begin(), box_entries.end());
         }
         return entries;
@@ -1657,7 +1660,7 @@ public:
                     left_lower, left_upper, segment->getBoxKeyRange(), thread_num
                 );
 
-                // Copy boxes directly from the original segment to the left segment
+                // Copy box pointers directly from the original segment to the left segment
                 left_segment->boxes.clear();
                 left_segment->boxes.reserve(merge_start);
                 for (int i = 0; i < merge_start; i++) {
@@ -1701,7 +1704,7 @@ public:
                     right_lower, right_upper, segment->getBoxKeyRange(), thread_num
                 );
 
-                // Copy boxes directly from the original segment to the right segment
+                // Copy box pointers directly from the original segment to the right segment
                 right_segment->boxes.clear();
                 int right_box_count = numBoxes - (merge_end + 1);
                 right_segment->boxes.reserve(right_box_count);
