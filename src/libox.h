@@ -46,6 +46,7 @@
 #define LOCK_EBR
 
 #define overflowCapacity 3
+#define emptySlots_between 5
 #define maxKey 64
 
 #define NUM_BOXES_TO_LOOK 3
@@ -1122,33 +1123,23 @@ public:
 };
 
 template <typename KeyType, typename ValueType>
-struct IndexStructure {
-    std::vector<Segment<KeyType, ValueType>*> segments;
-    std::vector<KeyType> segment_start_keys;
-    std::vector<int32_t> redundantArray;
-    double a, b;
-    std::atomic<uint64_t> version{0};
-    uint64_t structure_id;
-};
-
-template <typename KeyType, typename ValueType>
 class LiBox {
 private:
     double underflowThreshold;
     double overflowThreshold;
     int thread_num;
+    std::vector<Segment<KeyType, ValueType>*> segments;
+    std::vector<KeyType> segment_start_keys;
+    std::vector<int32_t> redundantArray;
+    double a, b;
 
     std::unique_ptr<Box<KeyType, ValueType>> small_boundary_box_;
     std::unique_ptr<Box<KeyType, ValueType>> big_boundary_box_;
-
-    std::atomic<IndexStructure<KeyType, ValueType>*> index_structure_;
 
     std::atomic<bool> global_splitting_{false};
     std::queue<int32_t> split_waiting_queue_;
     std::atomic<int32_t> splitting_segment_{-1};
     mutable std::mutex split_queue_mutex_;
-
-    static std::atomic<uint64_t> next_structure_id_;
 
     std::atomic<bool> is_segment_splitting_{false};
     static ThreadLocalWaitTimingStats is_segment_splitting_insert_wait_stats_;
@@ -1182,208 +1173,6 @@ private:
         is_segment_splitting_search_wait_stats_ = ThreadLocalWaitTimingStats(thread_num, "LiBox is_segment_splitting (search)");
         splitting_flag_wait_stats = ThreadLocalWaitTimingStats(thread_num, "Segment splitting_flag");
         wait_for_operations_stats_ = ThreadLocalWaitTimingStats(thread_num, "Segment wait_for_operations");
-    }
-
-    struct DeletionInfo {
-        IndexStructure<KeyType, ValueType>* structure;
-        int32_t replaced_segment_index;
-    };
-
-    class EpochBasedReclamation {
-    private:
-        struct alignas(128) ThreadSpecificEBRInfo {
-            std::atomic<uint32_t> current_epoch_{0};
-            uint32_t previously_accessed_epoch_{0};
-            std::atomic<bool> doing_operation_{false};
-
-            std::array<std::vector<DeletionInfo>, 3> free_lists_;
-
-            char padding_[128 - sizeof(current_epoch_) - sizeof(previously_accessed_epoch_)
-                             - sizeof(doing_operation_) - sizeof(free_lists_)];
-
-            ThreadSpecificEBRInfo() = default;
-
-            ThreadSpecificEBRInfo(const ThreadSpecificEBRInfo&) = delete;
-            ThreadSpecificEBRInfo& operator=(const ThreadSpecificEBRInfo&) = delete;
-            ThreadSpecificEBRInfo(ThreadSpecificEBRInfo&&) = delete;
-            ThreadSpecificEBRInfo& operator=(ThreadSpecificEBRInfo&&) = delete;
-
-            ~ThreadSpecificEBRInfo() {
-                for (uint32_t i = 0; i < 3; ++i) {
-                    free_for_epoch(i);
-                }
-            }
-
-            void schedule_for_deletion(IndexStructure<KeyType, ValueType>* structure,
-                                     int32_t replaced_seg_idx, uint32_t epoch) {
-                if (structure) {
-                    free_lists_[epoch % 3].emplace_back(DeletionInfo{structure, replaced_seg_idx});
-                }
-            }
-
-            void free_for_epoch(uint32_t epoch) {
-                std::vector<DeletionInfo>& free_list = free_lists_[epoch % 3];
-                for (const auto& info : free_list) {
-                    if (info.structure) {
-                        delete_index_structure_safely(info.structure, info.replaced_segment_index);
-                    }
-                }
-                free_list.clear();
-            }
-
-            uint32_t get_current_epoch() const {
-                return current_epoch_.load(std::memory_order_acquire);
-            }
-
-            bool is_doing_operation() const {
-                return doing_operation_.load(std::memory_order_acquire);
-            }
-
-        private:
-            void delete_index_structure_safely(IndexStructure<KeyType, ValueType>* structure,
-                                              int32_t replaced_segment_index) {
-                if (!structure) return;
-
-                if (replaced_segment_index >= 0 &&
-                    replaced_segment_index < static_cast<int32_t>(structure->segments.size())) {
-                    delete structure->segments[replaced_segment_index];
-                }
-                delete structure;
-            }
-        };
-
-        std::unique_ptr<ThreadSpecificEBRInfo[]> thread_infos_;
-        int max_threads_;
-        std::atomic<uint32_t> global_epoch_{0};
-
-        EpochBasedReclamation() = delete;
-
-    public:
-        explicit EpochBasedReclamation(int max_threads)
-            : max_threads_(max_threads) {
-            thread_infos_ = std::make_unique<ThreadSpecificEBRInfo[]>(max_threads);
-        }
-
-        ~EpochBasedReclamation() = default;
-
-        void enter_critical_section(int thread_id) {
-#ifdef LOCK_EBR
-            thread_infos_[thread_id].current_epoch_.fetch_add(1, std::memory_order_acq_rel);
-            thread_infos_[thread_id].doing_operation_.store(true, std::memory_order_release);
-#endif
-        }
-
-        void leave_critical_section(int thread_id) {
-#ifdef LOCK_EBR
-            thread_infos_[thread_id].doing_operation_.store(false, std::memory_order_release);
-#endif
-        }
-
-        void schedule_for_deletion(IndexStructure<KeyType, ValueType>* structure,
-                                 int32_t replaced_segment_index = -1) {
-            if (!structure) return;
-
-            int thread_id = ThreadIdManager::get_thread_id();
-
-            uint32_t current_global_epoch = global_epoch_.load(std::memory_order_acquire);
-            save_epoch_snapshot_to_all_threads(current_global_epoch);
-
-            wait_for_all_threads_safe();
-
-            thread_infos_[thread_id].schedule_for_deletion(structure, replaced_segment_index, current_global_epoch);
-
-            cleanup_old_epochs(current_global_epoch);
-
-            global_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        }
-
-        uint32_t get_global_epoch() const {
-            return global_epoch_.load(std::memory_order_acquire);
-        }
-
-        uint32_t get_thread_epoch(int thread_id) const {
-            if (thread_id >= 0 && thread_id < max_threads_) {
-                return thread_infos_[thread_id].get_current_epoch();
-            }
-            return 0;
-        }
-
-        bool is_thread_active(int thread_id) const {
-            if (thread_id >= 0 && thread_id < max_threads_) {
-                return thread_infos_[thread_id].is_doing_operation();
-            }
-            return false;
-        }
-
-    private:
-        void save_epoch_snapshot_to_all_threads(uint32_t epoch) {
-            for (int i = 0; i < max_threads_; ++i) {
-                thread_infos_[i].previously_accessed_epoch_ = thread_infos_[i].current_epoch_.load(std::memory_order_acquire);
-            }
-        }
-
-        void wait_for_all_threads_safe() {
-            for (int thread_idx = 0; thread_idx < max_threads_; ++thread_idx) {
-                ThreadSpecificEBRInfo& info = thread_infos_[thread_idx];
-
-                while (true) {
-                    if (!info.doing_operation_.load(std::memory_order_acquire)) {
-                        break;
-                    }
-
-                    if (info.current_epoch_.load(std::memory_order_acquire) > info.previously_accessed_epoch_) {
-                        break;
-                    }
-
-                    std::this_thread::yield();
-                }
-            }
-        }
-
-        void cleanup_old_epochs(uint32_t current_epoch) {
-            if (current_epoch >= 3) {
-                uint32_t old_epoch = current_epoch - 3;
-
-                for (int i = 0; i < max_threads_; ++i) {
-                    thread_infos_[i].free_for_epoch(old_epoch);
-                }
-            }
-        }
-    };
-
-    EpochBasedReclamation ebr_;
-
-    class EpochGuard {
-    private:
-        EpochBasedReclamation* ebr_;
-        int thread_id_;
-
-    public:
-        explicit EpochGuard(EpochBasedReclamation* ebr)
-            : ebr_(ebr), thread_id_(ThreadIdManager::get_thread_id()) {
-            ebr_->enter_critical_section(thread_id_);
-        }
-
-        ~EpochGuard() {
-            ebr_->leave_critical_section(thread_id_);
-        }
-
-        EpochGuard(const EpochGuard&) = delete;
-        EpochGuard& operator=(const EpochGuard&) = delete;
-        EpochGuard(EpochGuard&&) = delete;
-        EpochGuard& operator=(EpochGuard&&) = delete;
-
-        int get_thread_id() const {
-            return thread_id_;
-        }
-
-        EpochBasedReclamation* get_ebr() const {
-            return ebr_;
-        }
-    };
-
-    uint64_t generateNewStructureId() {
-        return next_structure_id_.fetch_add(1);
     }
 
     bool is_segment_splitting(int32_t seg_index) const {
@@ -1444,21 +1233,22 @@ public:
     LiBox(double uThreshold, double oThreshold, int thread_num)
         : underflowThreshold(uThreshold),
           overflowThreshold(oThreshold),
-          thread_num(thread_num),
-          ebr_(thread_num) {
+          thread_num(thread_num){
         ThreadIdManager::initialize(thread_num);
         initializeTimingStats(thread_num);
-        auto* initial = new IndexStructure<KeyType, ValueType>();
-        initial->structure_id = generateNewStructureId();
-        index_structure_.store(initial);
     }
 
     ~LiBox() {
-        auto* structure = index_structure_.load();
-        for (auto* seg : structure->segments) {
+        std::set<Segment<KeyType, ValueType>*> unique_segments;
+        for (auto* seg : segments) {
+            if (seg != nullptr) {
+                unique_segments.insert(seg);
+            }
+        }
+        
+        for (auto* seg : unique_segments) {
             delete seg;
         }
-        delete structure;
     }
 
     InsertResult insertKeyValue(KeyType key, ValueType value) {
@@ -1468,19 +1258,13 @@ public:
 
         retry_insert:
         {
-            EpochGuard guard(&ebr_);
-            auto* structure = index_structure_.load(std::memory_order_acquire);
-            seg_index = searchIndex(structure, key);
+            seg_index = searchIndex(key);
             if (seg_index < 0) {
                 cout << "Inserting into boundary box for key: " << key << endl;
                 return insertToBoundaryBox(key, value, seg_index);
             }
-            if (index_structure_.load()->structure_id != structure->structure_id) {
-                exponential_backoff(retry_count++);
-                goto retry_insert;
-            }
 
-            result = structure->segments[seg_index]->insertKeyValue(key, value);
+            result = segments[seg_index]->insertKeyValue(key, value);
             if (result.status == InsertStatus::SUCCESS) {
                 return result;
             }
@@ -1515,22 +1299,16 @@ public:
     }
 
     DeleteResult deleteKey(KeyType key) {
-        EpochGuard guard(&ebr_);
         int retry_count = 0;
 
     retry_delete:
-        auto* structure = index_structure_.load(std::memory_order_acquire);
-        int32_t seg_index = searchIndex(structure, key);
+        int32_t seg_index = searchIndex(key); 
         if (seg_index < 0) {
             cout << "Deleting from boundary box for key: " << key << endl;
             return deleteFromBoundaryBox(key, seg_index);
         }
-        if (index_structure_.load()->structure_id != structure->structure_id) {
-            exponential_backoff(retry_count++);
-            goto retry_delete;
-        }
 
-        DeleteResult ret = structure->segments[seg_index]->deleteKey(key);
+        DeleteResult ret = segments[seg_index]->deleteKey(key);
         if (ret.status == DeleteStatus::SPLIT || ret.status == DeleteStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
             is_segment_splitting_.wait(false, std::memory_order_acquire);
@@ -1544,22 +1322,16 @@ public:
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
-        EpochGuard guard(&ebr_);
         int retry_count = 0;
 
     retry_search:
-        auto* structure = index_structure_.load(std::memory_order_acquire);
-        int32_t seg_index = searchIndex(structure, key);
+        int32_t seg_index = searchIndex(key); 
         if (seg_index < 0) {
             cout << "Searching in boundary box for key: " << key << endl;
             return searchInBoundaryBox(key, seg_index);
         }
-        if (index_structure_.load()->structure_id != structure->structure_id) {
-            exponential_backoff(retry_count++);
-            goto retry_search;
-        }
 
-        SearchResult<KeyType, ValueType> ret = structure->segments[seg_index]->searchKey(key);
+        SearchResult<KeyType, ValueType> ret = segments[seg_index]->searchKey(key);
         if (ret.status == SearchStatus::SPLIT || ret.status == SearchStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
             is_segment_splitting_.wait(false, std::memory_order_acquire);
@@ -1585,14 +1357,39 @@ public:
         }
     }
 
+    void inPlaceReplaceSegment(int32_t old_seg_idx, std::vector<Segment<KeyType, ValueType>*> new_segments) {
+        Segment<KeyType, ValueType>* old_segment = segments[old_seg_idx];
+        
+        int start_pos = -1;
+        int end_pos = -1;
+        for (size_t i = 0; i < segments.size(); i++) {
+            if (segments[i] == old_segment) {
+                if (start_pos == -1) start_pos = i;
+                end_pos = i;
+            }
+        }
+        
+        for (int i = start_pos; i <= end_pos; i++) {
+            int new_seg_index = i - start_pos;
+            if (new_seg_index < static_cast<int>(new_segments.size())) {
+                segments[i] = new_segments[new_seg_index];
+                segment_start_keys[i] = new_segments[new_seg_index]->getLowerBound();
+            } else {
+                segments[i] = new_segments.back();
+                segment_start_keys[i] = new_segments.back()->getLowerBound();
+            }
+        }
+                
+        buildSearchIndex();
+    }
+
     void splitSegment(int32_t seg_index, int box_index) {
         auto split_start = std::chrono::high_resolution_clock::now();
         cout << "splitting segment " << seg_index << " due to overflow in box " << box_index << endl;
 
         auto t1 = std::chrono::high_resolution_clock::now();
         if (!global_splitting_.exchange(true)) {
-            auto* current = index_structure_.load();
-            auto* segment = current->segments[seg_index];
+            auto* segment = segments[seg_index];
             cout << "num boxes: " << segment->boxes.size() << endl;
             auto t2 = std::chrono::high_resolution_clock::now();
 
@@ -1716,7 +1513,7 @@ public:
             }
             auto t9 = std::chrono::high_resolution_clock::now();
 
-            atomicReplaceIndexStructure(seg_index, new_segments, split_start);
+            inPlaceReplaceSegment(seg_index, new_segments);
             auto t10 = std::chrono::high_resolution_clock::now();
 
             delete segment;
@@ -1780,39 +1577,67 @@ public:
         split_segment_total_stats.record_wait(split_duration);
     }
 
-    void buildSearchIndex(IndexStructure<KeyType, ValueType>* structure) {
-        if (structure->segment_start_keys.empty()) return;
+    void insertEmptySlots(int empty_slots_between = 3) {
+        if (segments.empty()) return;
+        
+        std::vector<Segment<KeyType, ValueType>*> new_segments;
+        std::vector<KeyType> new_start_keys;
+        
+        for (size_t i = 0; i < segments.size(); i++) {
+            new_segments.push_back(segments[i]);
+            new_start_keys.push_back(segment_start_keys[i]);
+            
+            if (i < segments.size() - 1) {
+                KeyType current_start = segment_start_keys[i];
+                
+                for (int j = 1; j <= empty_slots_between; j++) {
+                    new_segments.push_back(segments[i]);
+                    new_start_keys.push_back(current_start);
+                }
+            }
+        }
+        
+        new_start_keys.push_back(segment_start_keys.back());
+        
+        segments = std::move(new_segments);
+        segment_start_keys = std::move(new_start_keys);
+    }
 
-        int64_t redundantSize = structure->segment_start_keys.size() * 90;
-        structure->redundantArray.resize(redundantSize, -1);
+    void buildSearchIndex() {
+        if (segment_start_keys.empty()) return;
 
-        structure->a = static_cast<double>(redundantSize - 1) /
-                      (structure->segment_start_keys.back() - structure->segment_start_keys.front());
-        structure->b = -structure->a * structure->segment_start_keys.front();
+        int64_t redundantSize = segment_start_keys.size() * 90;
+        redundantArray.resize(redundantSize, -1);
 
-        for (size_t i = 0; i < structure->segment_start_keys.size(); i++) {
-            int64_t position = static_cast<int64_t>(structure->a * structure->segment_start_keys[i] + structure->b);
+        size_t memory_bytes = redundantSize * sizeof(int32_t);
+        std::cout << "redundantArray size: " << redundantSize << " elements" << std::endl;
+        std::cout << "redundantArray memory: " << memory_bytes << " bytes (" 
+                << (memory_bytes / 1024.0) << " KB, " 
+                << (memory_bytes / 1024.0 / 1024.0) << " MB)" << std::endl;
+
+        a = static_cast<double>(redundantSize - 1) /
+                      (segment_start_keys.back() - segment_start_keys.front());
+        b = -a * segment_start_keys.front();
+
+        for (size_t i = 0; i < segment_start_keys.size(); i++) {
+            int64_t position = static_cast<int64_t>(a * segment_start_keys[i] + b);
             if (position >= 0 && position < redundantSize) {
-                structure->redundantArray[position] = i;
+                redundantArray[position] = i;
             }
         }
 
         int32_t lastValidIndex = 0;
         for (size_t i = 0; i < redundantSize; i++) {
-            if (structure->redundantArray[i] == -1) {
-                structure->redundantArray[i] = lastValidIndex;
+            if (redundantArray[i] == -1) {
+                redundantArray[i] = lastValidIndex;
             } else {
-                lastValidIndex = structure->redundantArray[i];
+                lastValidIndex = redundantArray[i];
             }
         }
+
     }
 
-    int32_t searchIndex(IndexStructure<KeyType, ValueType>* structure, KeyType key) {
-        auto& segment_start_keys = structure->segment_start_keys;
-        auto& redundantArray = structure->redundantArray;
-        double a = structure->a;
-        double b = structure->b;
-
+    int32_t searchIndex(KeyType key) {
         if (key < segment_start_keys.front()) {
             return BELOW_LOWER_BOUND;
         } else if (key >= segment_start_keys.back()) {
@@ -1821,20 +1646,54 @@ public:
 
         int64_t position = static_cast<int64_t>(a * key + b);
         int32_t estimatedIndex = redundantArray[position];
+            
+        int32_t left_boundary = estimatedIndex;
+        while (left_boundary > 0 && 
+            segment_start_keys[left_boundary - 1] == segment_start_keys[estimatedIndex]) {
+            left_boundary--;
+        }
+        
+        int32_t right_boundary = estimatedIndex;
+        while (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) && 
+            segment_start_keys[right_boundary + 1] == segment_start_keys[estimatedIndex]) {
+            right_boundary++;
+        }
 
-        if (segment_start_keys[estimatedIndex] <= key &&
-            segment_start_keys[estimatedIndex + 1] > key) {
+        KeyType current_key = segment_start_keys[estimatedIndex];
+        KeyType next_key = (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ? 
+                        segment_start_keys[right_boundary + 1] : 
+                        std::numeric_limits<KeyType>::max();
+        
+        if (current_key <= key && key < next_key) {
             return estimatedIndex;
         }
 
-        if (segment_start_keys[estimatedIndex - 1] <= key &&
-            segment_start_keys[estimatedIndex] > key) {
-            return estimatedIndex - 1;
-        }
-
-        if (segment_start_keys[estimatedIndex + 1] <= key &&
-            segment_start_keys[estimatedIndex + 2] > key) {
-            return estimatedIndex + 1;
+        if (key < current_key) {
+            if (left_boundary > 0) {
+                int32_t prev_index = left_boundary - 1;
+                KeyType prev_key = segment_start_keys[prev_index];
+                if (prev_key <= key && key < current_key) {
+                    return prev_index;
+                }
+            }
+        } else { // key >= next_key
+            if (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) {
+                int32_t next_index = right_boundary + 1;
+                
+                int32_t next_right_boundary = next_index;
+                while (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) && 
+                    segment_start_keys[next_right_boundary + 1] == segment_start_keys[next_index]) {
+                    next_right_boundary++;
+                }
+                
+                KeyType next_next_key = (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ? 
+                                    segment_start_keys[next_right_boundary + 1] : 
+                                    std::numeric_limits<KeyType>::max();
+                
+                if (segment_start_keys[next_index] <= key && key < next_next_key) {
+                    return next_index;
+                }
+            }
         }
 
         if (segment_start_keys[estimatedIndex] < key) {
@@ -1884,40 +1743,8 @@ public:
                 }
             }
         }
+        
         return -1;
-    }
-
-    void atomicReplaceIndexStructure(int32_t old_seg_idx,
-                                     std::vector<Segment<KeyType, ValueType>*> new_segments,
-                                     std::chrono::high_resolution_clock::time_point start_time) {
-        auto* current = index_structure_.load(std::memory_order_acquire);
-        auto* new_structure = new IndexStructure<KeyType, ValueType>();
-
-        for (size_t i = 0; i < current->segments.size(); ++i) {
-            if (i == old_seg_idx) {
-                for (auto* seg : new_segments) {
-                    new_structure->segments.push_back(seg);
-                    new_structure->segment_start_keys.push_back(seg->getLowerBound());
-                }
-            } else {
-                new_structure->segments.push_back(current->segments[i]);
-                new_structure->segment_start_keys.push_back(current->segment_start_keys[i]);
-            }
-        }
-        new_structure->segment_start_keys.push_back(
-            new_structure->segments.back()->getUpperBound() + 1);
-
-        buildSearchIndex(new_structure);
-
-        new_structure->structure_id = generateNewStructureId();
-        new_structure->version.store(0);
-
-        auto* old = index_structure_.exchange(new_structure, std::memory_order_acq_rel);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        cout << "Total split time: " << total_duration.count() << " microseconds" << endl;
-
-        ebr_.schedule_for_deletion(old);
     }
 
     void loadConfigByFile(const string& config_file) {
@@ -1926,7 +1753,6 @@ public:
             throw runtime_error("Failed to open config file.");
         }
 
-        auto* new_structure = new IndexStructure<KeyType, ValueType>();
         string line;
         while (getline(config, line)) {
             istringstream iss(line);
@@ -1957,20 +1783,17 @@ public:
             }
 
             auto* seg = new Segment<KeyType, ValueType>(lower, upper, box_range, thread_num);
-            new_structure->segments.push_back(seg);
-            new_structure->segment_start_keys.push_back(lower);
+            segments.push_back(seg);
+            segment_start_keys.push_back(lower);
         }
 
-        if (!new_structure->segments.empty()) {
-            new_structure->segment_start_keys.push_back(
-                new_structure->segments.back()->getUpperBound() + 1);
+        if (!segments.empty()) {
+            segment_start_keys.push_back(
+                segments.back()->getUpperBound() + 1);
         }
 
-        buildSearchIndex(new_structure);
-        new_structure->structure_id = generateNewStructureId();
-
-        auto* old = index_structure_.exchange(new_structure);
-        delete old;
+        insertEmptySlots(emptySlots_between);
+        buildSearchIndex();
     }
 
     void bulk_load(std::pair<KeyType, ValueType>* key_value, size_t num) {
@@ -2083,9 +1906,6 @@ public:
         std::cout << "==========================================\n" << std::endl;
     }
 };
-
-    template <typename KeyType, typename ValueType>
-    std::atomic<uint64_t> LiBox<KeyType, ValueType>::next_structure_id_{1};
 
         // Static member definitions for timing stats
     template <typename KeyType, typename ValueType>
