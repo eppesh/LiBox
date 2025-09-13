@@ -929,10 +929,11 @@ private:
     mutable ThreadLocalCounter operation_counter_;
     std::atomic_flag splitting_flag_ = ATOMIC_FLAG_INIT;
 public:
-    KeyType lower_bound;
+    KeyType lower_bound; 
     KeyType upper_bound;
     int numBoxes;
     mutable std::atomic<bool> splitting_{false};
+    std::atomic<bool> is_splitting_{false};
     std::vector<Box<KeyType, ValueType>> boxes;
 
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
@@ -969,6 +970,27 @@ public:
             splitting_.store(other.splitting_.load());
         }
         return *this;
+    }
+
+    bool try_mark_for_splitting() {
+        bool expected = false;
+        return is_splitting_.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    
+    void unmark_splitting() {
+        is_splitting_.store(false, std::memory_order_release);
+        is_splitting_.notify_all();
+    }
+    
+    bool is_currently_splitting() const {
+        return is_splitting_.load(std::memory_order_acquire);
+    }
+    
+    void wait_for_split_completion() const {
+        is_splitting_.wait(true, std::memory_order_acquire);
     }
 
     bool enter() {
@@ -1136,10 +1158,13 @@ private:
     std::unique_ptr<Box<KeyType, ValueType>> small_boundary_box_;
     std::unique_ptr<Box<KeyType, ValueType>> big_boundary_box_;
 
-    std::atomic<bool> global_splitting_{false};
-    std::queue<int32_t> split_waiting_queue_;
-    std::atomic<int32_t> splitting_segment_{-1};
-    mutable std::mutex split_queue_mutex_;
+    std::atomic<int> waiting_for_critical_section_{0};
+
+    // std::atomic<bool> global_splitting_{false};
+    // std::queue<int32_t> split_waiting_queue_;
+    // std::atomic<int32_t> splitting_segment_{-1};
+    // mutable std::mutex split_queue_mutex_;
+    std::atomic<bool> critical_section_lock_{false};
 
     std::atomic<bool> is_segment_splitting_{false};
     static ThreadLocalWaitTimingStats is_segment_splitting_insert_wait_stats_;
@@ -1173,23 +1198,6 @@ private:
         is_segment_splitting_search_wait_stats_ = ThreadLocalWaitTimingStats(thread_num, "LiBox is_segment_splitting (search)");
         splitting_flag_wait_stats = ThreadLocalWaitTimingStats(thread_num, "Segment splitting_flag");
         wait_for_operations_stats_ = ThreadLocalWaitTimingStats(thread_num, "Segment wait_for_operations");
-    }
-
-    bool is_segment_splitting(int32_t seg_index) const {
-        return splitting_segment_.load(std::memory_order_acquire) == seg_index;
-    }
-
-    bool mark_segment_splitting(int32_t seg_index) {
-        int32_t expected = -1;
-        return splitting_segment_.compare_exchange_strong(
-            expected, seg_index,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire);
-    }
-
-    void unmark_segment_splitting(int32_t seg_index) {
-        assert(splitting_segment_.load() == seg_index);
-        splitting_segment_.store(-1, std::memory_order_release);
     }
 
     InsertResult insertToBoundaryBox(KeyType key, ValueType value, int32_t box_type) {
@@ -1229,6 +1237,18 @@ private:
         DeleteResult result = boundary_box->deleteKey(key);
         return result;
     }
+        
+    void acquire_critical_section() {
+        while (critical_section_lock_.exchange(true, std::memory_order_acquire)) {
+            while (critical_section_lock_.load(std::memory_order_relaxed)) {
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    void release_critical_section() {
+        critical_section_lock_.store(false, std::memory_order_release);
+    }
 public:
     LiBox(double uThreshold, double oThreshold, int thread_num)
         : underflowThreshold(uThreshold),
@@ -1255,6 +1275,7 @@ public:
         InsertResult result;
         int retry_count = 0;
         int32_t seg_index = -1;
+        Segment<KeyType, ValueType>* target_segment = nullptr;
 
         retry_insert:
         {
@@ -1264,21 +1285,19 @@ public:
                 return insertToBoundaryBox(key, value, seg_index);
             }
 
-            result = segments[seg_index]->insertKeyValue(key, value);
+            target_segment = segments[seg_index];
+            result = target_segment->insertKeyValue(key, value);
             if (result.status == InsertStatus::SUCCESS) {
                 return result;
             }
         }
 
         if (result.status == InsertStatus::FULL) {
-            if (!is_segment_splitting(seg_index) && splitting_segment_.load(std::memory_order_acquire) == -1) {
-                if (mark_segment_splitting(seg_index)) {
-                    is_segment_splitting_.store(true, std::memory_order_release);
-                    splitSegment(seg_index, result.box_index);
-                }else{
-                    exponential_backoff(retry_count++);
-                    goto retry_insert;
-                }
+            if (target_segment->try_mark_for_splitting()) {
+                splitSegment(target_segment, result.box_index);
+            }else {
+                exponential_backoff(retry_count++);
+                goto retry_insert;
             }
             // If multiple splits are happening, they need to be added to the queue,
             // and the operations on that segment should be blocked immediately.
@@ -1289,7 +1308,7 @@ public:
         } else if (result.status == InsertStatus::SPLIT ||
                    result.status == InsertStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
-            is_segment_splitting_.wait(true, std::memory_order_acquire);
+            target_segment->wait_for_split_completion();
             auto wait_end = std::chrono::high_resolution_clock::now();
             auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
             is_segment_splitting_insert_wait_stats_.record_wait(wait_duration);
@@ -1308,7 +1327,8 @@ public:
             return deleteFromBoundaryBox(key, seg_index);
         }
 
-        DeleteResult ret = segments[seg_index]->deleteKey(key);
+        Segment<KeyType, ValueType>* target_segment = segments[seg_index];
+        DeleteResult ret = target_segment->deleteKey(key);
         if (ret.status == DeleteStatus::SPLIT || ret.status == DeleteStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
             is_segment_splitting_.wait(true, std::memory_order_acquire);
@@ -1331,10 +1351,11 @@ public:
             return searchInBoundaryBox(key, seg_index);
         }
 
-        SearchResult<KeyType, ValueType> ret = segments[seg_index]->searchKey(key);
+        Segment<KeyType, ValueType>* target_segment = segments[seg_index];
+        SearchResult<KeyType, ValueType> ret = target_segment->searchKey(key);
         if (ret.status == SearchStatus::SPLIT || ret.status == SearchStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
-            is_segment_splitting_.wait(true, std::memory_order_acquire);
+            target_segment->wait_for_split_completion();
             auto wait_end = std::chrono::high_resolution_clock::now();
             auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
             is_segment_splitting_search_wait_stats_.record_wait(wait_duration);
@@ -1357,13 +1378,11 @@ public:
         }
     }
 
-    void inPlaceReplaceSegment(int32_t old_seg_idx, std::vector<Segment<KeyType, ValueType>*> new_segments) {
-        Segment<KeyType, ValueType>* old_segment = segments[old_seg_idx];
-        
+    void inPlaceReplaceSegment(Segment<KeyType, ValueType>* old_segment_ptr, std::vector<Segment<KeyType, ValueType>*> new_segments) {        
         int start_pos = -1;
         int end_pos = -1;
         for (size_t i = 0; i < segments.size(); i++) {
-            if (segments[i] == old_segment) {
+            if (segments[i] == old_segment_ptr) {
                 if (start_pos == -1) start_pos = i;
                 end_pos = i;
             }
@@ -1383,247 +1402,240 @@ public:
         buildSearchIndex();
     }
 
-    void splitSegment(int32_t seg_index, int box_index) {
+    void splitSegment(Segment<KeyType, ValueType>* segment_ptr, int box_index) {
         auto split_start = std::chrono::high_resolution_clock::now();
-        cout << "splitting segment " << seg_index << " due to overflow in box " << box_index << endl;
 
         auto t1 = std::chrono::high_resolution_clock::now();
-        if (!global_splitting_.exchange(true)) {
-            auto* segment = segments[seg_index];
-            cout << "num boxes: " << segment->boxes.size() << endl;
-            auto t2 = std::chrono::high_resolution_clock::now();
+        auto* segment = segment_ptr;
+        cout << "num boxes: " << segment->boxes.size() << endl;
+        auto t2 = std::chrono::high_resolution_clock::now();
 
-            // Wait for all ongoing operations to complete
-            auto wait_start = std::chrono::high_resolution_clock::now();
-            segment->wait_for_operations();
-            auto wait_end = std::chrono::high_resolution_clock::now();
-            auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
-            wait_for_operations_stats_.record_wait(wait_duration);
-            auto t3 = std::chrono::high_resolution_clock::now();
+        // Wait for all ongoing operations to complete
+        auto wait_start = std::chrono::high_resolution_clock::now();
+        segment->wait_for_operations();
+        auto wait_end = std::chrono::high_resolution_clock::now();
+        auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
+        wait_for_operations_stats_.record_wait(wait_duration);
+        auto t3 = std::chrono::high_resolution_clock::now();
 
-            // Calculate the range of boxes to process
-            int left_count = NUM_BOXES_TO_LOOK;
-            int right_count = NUM_BOXES_TO_LOOK;
-            size_t numBoxes = segment->getBoxCount();
-            int merge_start = std::max(0, box_index - left_count);
-            int merge_end = std::min(static_cast<int>(numBoxes) - 1, box_index + right_count);
+        // Calculate the range of boxes to process
+        int left_count = NUM_BOXES_TO_LOOK;
+        int right_count = NUM_BOXES_TO_LOOK;
+        size_t numBoxes = segment->getBoxCount();
+        int merge_start = std::max(0, box_index - left_count);
+        int merge_end = std::min(static_cast<int>(numBoxes) - 1, box_index + right_count);
 
-            // Extract entries from the boxes to be merged
-            auto mergedEntries = segment->prepare_for_split_stage1(merge_start, merge_end);
-            auto t4 = std::chrono::high_resolution_clock::now();
+        // Extract entries from the boxes to be merged
+        auto mergedEntries = segment->prepare_for_split_stage1(merge_start, merge_end);
+        auto t4 = std::chrono::high_resolution_clock::now();
 
-            size_t merged_entries_size = mergedEntries.size();
+        size_t merged_entries_size = mergedEntries.size();
 
-            // Early return if no entries to process
-            if (mergedEntries.empty()) {
-                unmark_segment_splitting(seg_index);
-                global_splitting_.store(false);
-                is_segment_splitting_.store(false, std::memory_order_release);
-                is_segment_splitting_.notify_all();
-                return;
-            }
-
-            // Extract keys for segmentation calculation
-            vector<KeyType> keys;
-            keys.reserve(mergedEntries.size());
-            for (const auto& entry : mergedEntries) {
-                keys.push_back(entry.first);
-            }
-            auto t5 = std::chrono::high_resolution_clock::now();
-
-            // Calculate new segment boundaries
-            KeyType merged_lower = segment->getBoxLower(merge_start);
-            KeyType merged_upper = segment->getBoxUpper(merge_end);
-
-            std::vector<keySegment<KeyType>> keysegments =
-                calculateSegments(keys, overflowThreshold, underflowThreshold, 15, merged_lower, merged_upper);
-            auto t6 = std::chrono::high_resolution_clock::now();
-
-            std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
-            auto t7 = std::chrono::high_resolution_clock::now();
-
-            // Create the middle merged segments
-            std::vector<Segment<KeyType, ValueType>*> merged_segments;
-            merged_segments.reserve(final_segments.size());
-            for (const auto& struct_seg : final_segments) {
-                auto* new_seg = new Segment<KeyType, ValueType>(
-                    struct_seg.seg_lower,
-                    struct_seg.seg_upper,
-                    struct_seg.box_range,
-                    thread_num
-                );
-                merged_segments.push_back(new_seg);
-            }
-
-            // Populate merged segments with data
-            populateSegmentsSerial(mergedEntries, merged_segments);
-            auto t8 = std::chrono::high_resolution_clock::now();
-
-            // Prepare containers for final segment arrangement
-            std::vector<Segment<KeyType, ValueType>*> new_segments;
-            std::vector<KeyType> new_segment_start_keys;
-
-            // Determine if we need left and right segments
-            bool has_left = (merge_start > 0);
-            bool has_right = (merge_end < static_cast<int>(numBoxes) - 1);
-
-            // Initialize timing variables to avoid uninitialized access
-            std::chrono::high_resolution_clock::time_point t_right_start = std::chrono::high_resolution_clock::now();
-            std::chrono::high_resolution_clock::time_point t_right_end = t_right_start;
-            std::chrono::high_resolution_clock::time_point t_left_start = std::chrono::high_resolution_clock::now();
-            std::chrono::high_resolution_clock::time_point t_left_end = t_left_start;
-
-            // Process right segment first to preserve original segment data integrity
-            Segment<KeyType, ValueType>* right_segment = nullptr;
-            if (has_right) {
-                t_right_start = std::chrono::high_resolution_clock::now();
-                
-                if (!has_left) {
-                    // Only right segment exists, reuse original segment in-place
-                    right_segment = segment;
-                    KeyType new_lower = segment->getBoxLower(merge_end + 1);
-                    right_segment->lower_bound = new_lower;
-                    
-                    // Remove boxes that don't belong to right segment
-                    if (merge_end + 1 < static_cast<int>(numBoxes)) {
-                        right_segment->boxes.erase(
-                            right_segment->boxes.begin(),
-                            right_segment->boxes.begin() + merge_end + 1
-                        );
-                        right_segment->numBoxes = numBoxes - (merge_end + 1);
-                    } else {
-                        // Edge case: no boxes to preserve
-                        right_segment->boxes.clear();
-                        right_segment->numBoxes = 0;
-                    }
-                } else {
-                    // Left segment exists, need to create new right segment
-                    KeyType right_lower = segment->getBoxLower(merge_end + 1);
-                    KeyType right_upper = segment->getUpperBound();
-                    right_segment = new Segment<KeyType, ValueType>(
-                        right_lower, right_upper, segment->getBoxKeyRange(), thread_num
-                    );
-                    
-                    // Copy boxes from original segment (data is still intact at this point)
-                    right_segment->boxes.clear();
-                    if (merge_end + 1 < static_cast<int>(numBoxes)) {
-                        int right_box_count = numBoxes - (merge_end + 1);
-                        right_segment->boxes.reserve(right_box_count);
-                        for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
-                            right_segment->boxes.push_back(segment->boxes[i]);
-                        }
-                        right_segment->numBoxes = right_box_count;
-                    } else {
-                        right_segment->numBoxes = 0;
-                    }
-                }
-                
-                t_right_end = std::chrono::high_resolution_clock::now();
-            }
-
-            // Process left segment after right (safe to modify original segment in-place now)
-            Segment<KeyType, ValueType>* left_segment = nullptr;
-            if (has_left) {
-                t_left_start = std::chrono::high_resolution_clock::now();
-                
-                // Reuse original segment as left segment in-place
-                left_segment = segment;
-                KeyType new_upper = segment->getBoxUpper(merge_start - 1);
-                left_segment->upper_bound = new_upper;
-                
-                // Remove boxes that don't belong to left segment
-                if (merge_start < static_cast<int>(numBoxes)) {
-                    left_segment->boxes.erase(
-                        left_segment->boxes.begin() + merge_start,
-                        left_segment->boxes.end()
-                    );
-                    left_segment->numBoxes = merge_start;
-                }
-                
-                t_left_end = std::chrono::high_resolution_clock::now();
-            }
-
-            // Assemble new_segments in logical order: left → merged → right
-            if (has_left) {
-                new_segments.push_back(left_segment);
-                new_segment_start_keys.push_back(left_segment->getLowerBound());
-            }
-
-            for (size_t i = 0; i < merged_segments.size(); i++) {
-                new_segments.push_back(merged_segments[i]);
-                new_segment_start_keys.push_back(merged_segments[i]->getLowerBound());
-            }
-
-            if (has_right) {
-                new_segments.push_back(right_segment);
-                new_segment_start_keys.push_back(right_segment->getLowerBound());
-            }
-
-            auto t9 = std::chrono::high_resolution_clock::now();
-            size_t new_segments_size = new_segments.size();
-
-            // Replace old segment with new segments in the global structure
-            inPlaceReplaceSegment(seg_index, new_segments);
-            auto t10 = std::chrono::high_resolution_clock::now();
-
-            // Memory management: only delete original segment if it's not reused
-            if (!has_left && !has_right) {
-                // Entire segment was rebuilt, delete original segment
-                delete segment;
-            }
-            // If has_left is true, original segment is reused as left_segment, no delete needed
-            // If only has_right is true and has_left is false, original segment is reused as right_segment, no delete needed
-
-            segment->splitting_.store(false, std::memory_order_release);
-            // Signal completion of splitting operation
-            is_segment_splitting_.store(false, std::memory_order_release);
-            is_segment_splitting_.notify_all();
-            auto t11 = std::chrono::high_resolution_clock::now();
-
-            // Release global splitting lock
-            unmark_segment_splitting(seg_index);
-            global_splitting_.store(false);
-            auto t12 = std::chrono::high_resolution_clock::now();
-
-            // Calculate timing statistics (handles cases where segments don't exist)
-            auto duration_left_seg = has_left ? 
-                std::chrono::duration_cast<std::chrono::microseconds>(t_left_end - t_left_start).count() : 0;
-            auto duration_right_seg = has_right ? 
-                std::chrono::duration_cast<std::chrono::microseconds>(t_right_end - t_right_start).count() : 0;
-            
-            auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-            auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
-            auto duration3 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
-            auto duration4 = std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count();
-            auto duration5 = std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
-            auto duration6 = std::chrono::duration_cast<std::chrono::microseconds>(t7 - t6).count();
-            auto duration7 = std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
-            auto duration8 = std::chrono::duration_cast<std::chrono::microseconds>(t9 - t8).count() - duration_left_seg - duration_right_seg;
-            auto duration9 = std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
-            auto duration10 = std::chrono::duration_cast<std::chrono::microseconds>(t11 - t10).count();
-            auto duration11 = std::chrono::duration_cast<std::chrono::microseconds>(t12 - t11).count();
-
-            // Accumulate timing statistics for performance analysis
-            accumulated_load_time_us_.fetch_add(duration1, std::memory_order_relaxed);
-            accumulated_wait_time_us_.fetch_add(duration2, std::memory_order_relaxed);
-            accumulated_prepare_time_us_.fetch_add(duration3, std::memory_order_relaxed);
-            accumulated_keys_time_us_.fetch_add(duration4, std::memory_order_relaxed);
-            accumulated_calculate_time_us_.fetch_add(duration5, std::memory_order_relaxed);
-            accumulated_toStruct_time_us_.fetch_add(duration6, std::memory_order_relaxed);
-            accumulated_create_time_us_.fetch_add(duration7, std::memory_order_relaxed);
-            accumulated_populate_time_us_.fetch_add(duration8, std::memory_order_relaxed);
-            accumulated_replace_time_us_.fetch_add(duration9, std::memory_order_relaxed);
-            accumulated_cleanup_time_us_.fetch_add(duration10, std::memory_order_relaxed);
-            accumulated_unmark_time_us_.fetch_add(duration11, std::memory_order_relaxed);
-            accumulated_left_seg_time_us_.fetch_add(duration_left_seg, std::memory_order_relaxed);
-            accumulated_right_seg_time_us_.fetch_add(duration_right_seg, std::memory_order_relaxed);
-
-            // Accumulate operation statistics
-            total_split_operations_.fetch_add(1, std::memory_order_relaxed);
-            total_entries_processed_.fetch_add(merged_entries_size, std::memory_order_relaxed);
-            total_merged_entries_size_.fetch_add(merged_entries_size, std::memory_order_relaxed);
-            total_segments_created_.fetch_add(new_segments_size, std::memory_order_relaxed);
+        // Early return if no entries to process
+        if (mergedEntries.empty()) {
+            segment->unmark_splitting();
+            return;
         }
+
+        // Extract keys for segmentation calculation
+        vector<KeyType> keys;
+        keys.reserve(mergedEntries.size());
+        for (const auto& entry : mergedEntries) {
+            keys.push_back(entry.first);
+        }
+        auto t5 = std::chrono::high_resolution_clock::now();
+
+        // Calculate new segment boundaries
+        KeyType merged_lower = segment->getBoxLower(merge_start);
+        KeyType merged_upper = segment->getBoxUpper(merge_end);
+
+        std::vector<keySegment<KeyType>> keysegments =
+            calculateSegments(keys, overflowThreshold, underflowThreshold, 15, merged_lower, merged_upper);
+        auto t6 = std::chrono::high_resolution_clock::now();
+
+        std::vector<StructSegment<KeyType>> final_segments = toStructSegment(keysegments);
+        auto t7 = std::chrono::high_resolution_clock::now();
+
+        // Create the middle merged segments
+        std::vector<Segment<KeyType, ValueType>*> merged_segments;
+        merged_segments.reserve(final_segments.size());
+        for (const auto& struct_seg : final_segments) {
+            auto* new_seg = new Segment<KeyType, ValueType>(
+                struct_seg.seg_lower,
+                struct_seg.seg_upper,
+                struct_seg.box_range,
+                thread_num
+            );
+            merged_segments.push_back(new_seg);
+        }
+
+        // Populate merged segments with data
+        populateSegmentsSerial(mergedEntries, merged_segments);
+        auto t8 = std::chrono::high_resolution_clock::now();
+
+        // Prepare containers for final segment arrangement
+        std::vector<Segment<KeyType, ValueType>*> new_segments;
+        std::vector<KeyType> new_segment_start_keys;
+
+        // Determine if we need left and right segments
+        bool has_left = (merge_start > 0);
+        bool has_right = (merge_end < static_cast<int>(numBoxes) - 1);
+
+        // Initialize timing variables to avoid uninitialized access
+        std::chrono::high_resolution_clock::time_point t_right_start = std::chrono::high_resolution_clock::now();
+        std::chrono::high_resolution_clock::time_point t_right_end = t_right_start;
+        std::chrono::high_resolution_clock::time_point t_left_start = std::chrono::high_resolution_clock::now();
+        std::chrono::high_resolution_clock::time_point t_left_end = t_left_start;
+
+        // Process right segment first to preserve original segment data integrity
+        Segment<KeyType, ValueType>* right_segment = nullptr;
+        if (has_right) {
+            t_right_start = std::chrono::high_resolution_clock::now();
+            
+            if (!has_left) {
+                // Only right segment exists, reuse original segment in-place
+                right_segment = segment;
+                KeyType new_lower = segment->getBoxLower(merge_end + 1);
+                right_segment->lower_bound = new_lower;
+                
+                // Remove boxes that don't belong to right segment
+                if (merge_end + 1 < static_cast<int>(numBoxes)) {
+                    right_segment->boxes.erase(
+                        right_segment->boxes.begin(),
+                        right_segment->boxes.begin() + merge_end + 1
+                    );
+                    right_segment->numBoxes = numBoxes - (merge_end + 1);
+                } else {
+                    // Edge case: no boxes to preserve
+                    right_segment->boxes.clear();
+                    right_segment->numBoxes = 0;
+                }
+            } else {
+                // Left segment exists, need to create new right segment
+                KeyType right_lower = segment->getBoxLower(merge_end + 1);
+                KeyType right_upper = segment->getUpperBound();
+                right_segment = new Segment<KeyType, ValueType>(
+                    right_lower, right_upper, segment->getBoxKeyRange(), thread_num
+                );
+                
+                // Copy boxes from original segment (data is still intact at this point)
+                right_segment->boxes.clear();
+                if (merge_end + 1 < static_cast<int>(numBoxes)) {
+                    int right_box_count = numBoxes - (merge_end + 1);
+                    right_segment->boxes.reserve(right_box_count);
+                    for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
+                        right_segment->boxes.push_back(segment->boxes[i]);
+                    }
+                    right_segment->numBoxes = right_box_count;
+                } else {
+                    right_segment->numBoxes = 0;
+                }
+            }
+            
+            t_right_end = std::chrono::high_resolution_clock::now();
+        }
+
+        // Process left segment after right (safe to modify original segment in-place now)
+        Segment<KeyType, ValueType>* left_segment = nullptr;
+        if (has_left) {
+            t_left_start = std::chrono::high_resolution_clock::now();
+            
+            // Reuse original segment as left segment in-place
+            left_segment = segment;
+            KeyType new_upper = segment->getBoxUpper(merge_start - 1);
+            left_segment->upper_bound = new_upper;
+            
+            // Remove boxes that don't belong to left segment
+            if (merge_start < static_cast<int>(numBoxes)) {
+                left_segment->boxes.erase(
+                    left_segment->boxes.begin() + merge_start,
+                    left_segment->boxes.end()
+                );
+                left_segment->numBoxes = merge_start;
+            }
+            
+            t_left_end = std::chrono::high_resolution_clock::now();
+        }
+
+        // Assemble new_segments in logical order: left → merged → right
+        if (has_left) {
+            new_segments.push_back(left_segment);
+            new_segment_start_keys.push_back(left_segment->getLowerBound());
+        }
+
+        for (size_t i = 0; i < merged_segments.size(); i++) {
+            new_segments.push_back(merged_segments[i]);
+            new_segment_start_keys.push_back(merged_segments[i]->getLowerBound());
+        }
+
+        if (has_right) {
+            new_segments.push_back(right_segment);
+            new_segment_start_keys.push_back(right_segment->getLowerBound());
+        }
+
+        auto t9 = std::chrono::high_resolution_clock::now();
+        size_t new_segments_size = new_segments.size();
+        acquire_critical_section();
+        // Replace old segment with new segments in the global structure
+        inPlaceReplaceSegment(segment, new_segments);
+        auto t10 = std::chrono::high_resolution_clock::now();
+
+        // Memory management: only delete original segment if it's not reused
+        if (!has_left && !has_right) {
+            // Entire segment was rebuilt, delete original segment
+            delete segment;
+        }
+        // If has_left is true, original segment is reused as left_segment, no delete needed
+        // If only has_right is true and has_left is false, original segment is reused as right_segment, no delete needed
+        segment->unmark_splitting();
+        segment->splitting_.store(false, std::memory_order_release);
+        // Signal completion of splitting operation
+        is_segment_splitting_.store(false, std::memory_order_release);
+        is_segment_splitting_.notify_all();
+        auto t11 = std::chrono::high_resolution_clock::now();
+
+        // Release global splitting lock
+        release_critical_section();
+        auto t12 = std::chrono::high_resolution_clock::now();
+
+        // Calculate timing statistics (handles cases where segments don't exist)
+        auto duration_left_seg = has_left ? 
+            std::chrono::duration_cast<std::chrono::microseconds>(t_left_end - t_left_start).count() : 0;
+        auto duration_right_seg = has_right ? 
+            std::chrono::duration_cast<std::chrono::microseconds>(t_right_end - t_right_start).count() : 0;
+        
+        auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+        auto duration3 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
+        auto duration4 = std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count();
+        auto duration5 = std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
+        auto duration6 = std::chrono::duration_cast<std::chrono::microseconds>(t7 - t6).count();
+        auto duration7 = std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
+        auto duration8 = std::chrono::duration_cast<std::chrono::microseconds>(t9 - t8).count() - duration_left_seg - duration_right_seg;
+        auto duration9 = std::chrono::duration_cast<std::chrono::microseconds>(t10 - t9).count();
+        auto duration10 = std::chrono::duration_cast<std::chrono::microseconds>(t11 - t10).count();
+        auto duration11 = std::chrono::duration_cast<std::chrono::microseconds>(t12 - t11).count();
+
+        // Accumulate timing statistics for performance analysis
+        accumulated_load_time_us_.fetch_add(duration1, std::memory_order_relaxed);
+        accumulated_wait_time_us_.fetch_add(duration2, std::memory_order_relaxed);
+        accumulated_prepare_time_us_.fetch_add(duration3, std::memory_order_relaxed);
+        accumulated_keys_time_us_.fetch_add(duration4, std::memory_order_relaxed);
+        accumulated_calculate_time_us_.fetch_add(duration5, std::memory_order_relaxed);
+        accumulated_toStruct_time_us_.fetch_add(duration6, std::memory_order_relaxed);
+        accumulated_create_time_us_.fetch_add(duration7, std::memory_order_relaxed);
+        accumulated_populate_time_us_.fetch_add(duration8, std::memory_order_relaxed);
+        accumulated_replace_time_us_.fetch_add(duration9, std::memory_order_relaxed);
+        accumulated_cleanup_time_us_.fetch_add(duration10, std::memory_order_relaxed);
+        accumulated_unmark_time_us_.fetch_add(duration11, std::memory_order_relaxed);
+        accumulated_left_seg_time_us_.fetch_add(duration_left_seg, std::memory_order_relaxed);
+        accumulated_right_seg_time_us_.fetch_add(duration_right_seg, std::memory_order_relaxed);
+
+        // Accumulate operation statistics
+        total_split_operations_.fetch_add(1, std::memory_order_relaxed);
+        total_entries_processed_.fetch_add(merged_entries_size, std::memory_order_relaxed);
+        total_merged_entries_size_.fetch_add(merged_entries_size, std::memory_order_relaxed);
+        total_segments_created_.fetch_add(new_segments_size, std::memory_order_relaxed);
 
         // Record total split operation duration
         auto split_end = std::chrono::high_resolution_clock::now();
