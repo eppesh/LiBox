@@ -928,13 +928,15 @@ private:
 
     mutable ThreadLocalCounter operation_counter_;
     std::atomic_flag splitting_flag_ = ATOMIC_FLAG_INIT;
+
+    Box<KeyType, ValueType>* first_box_ptr;
+    size_t active_box_count;
 public:
     KeyType lower_bound; 
     KeyType upper_bound;
     int numBoxes;
     mutable std::atomic<bool> splitting_{false};
     std::atomic<bool> is_splitting_{false};
-    std::vector<Box<KeyType, ValueType>> boxes;
 
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
@@ -942,8 +944,24 @@ public:
         size_t total = upper - lower + 1;
         size_t box_count = total / box_range;
         if (total % box_range != 0) box_count++;
+        
         numBoxes = box_count;
-        boxes.resize(box_count);
+        active_box_count = box_count;
+        
+        first_box_ptr = new Box<KeyType, ValueType>[box_count];
+        
+        for (size_t i = 0; i < box_count; i++) {
+            new (&first_box_ptr[i]) Box<KeyType, ValueType>();
+        }
+    }
+
+    Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num,
+            Box<KeyType, ValueType>* existing_boxes, size_t box_count, bool take_ownership = false)
+        : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
+          operation_counter_(thread_num), num_threads(thread_num) {
+        numBoxes = box_count;
+        active_box_count = box_count;
+        first_box_ptr = existing_boxes;
     }
 
     Segment(const Segment&) = delete;
@@ -954,8 +972,9 @@ public:
           upper_bound(other.upper_bound),
           box_key_range(other.box_key_range),
           numBoxes(other.numBoxes),
+          active_box_count(other.active_box_count),
           operation_counter_(std::move(other.operation_counter_)),
-          boxes(std::move(other.boxes)) {
+          first_box_ptr(other.first_box_ptr) {
         splitting_.store(other.splitting_.load());
     }
 
@@ -965,12 +984,15 @@ public:
             upper_bound = other.upper_bound;
             box_key_range = other.box_key_range;
             numBoxes = other.numBoxes;
+            active_box_count = other.active_box_count;
             operation_counter_ = std::move(other.operation_counter_);
-            boxes = std::move(other.boxes);
+            first_box_ptr = other.first_box_ptr;
             splitting_.store(other.splitting_.load());
         }
         return *this;
     }
+
+    ~Segment() {}
 
     bool try_mark_for_splitting() {
         bool expected = false;
@@ -1023,11 +1045,12 @@ public:
         }
         if (key < lower_bound || key >= upper_bound) {
             leave();
+            cout << "Out of range insert: key=" << key << ", range=[" << lower_bound << ", " << upper_bound << ")" << endl;
             return {InsertStatus::OUT_OF_RANGE, -1};
         }
 
         size_t box_index = (key - lower_bound) / box_key_range;
-        InsertResult ret = boxes[box_index].insertKeyValue(key, value);
+        InsertResult ret = (first_box_ptr + box_index)->insertKeyValue(key, value);
         // ensure overflowing box index propagates up
         ret.box_index = static_cast<int>(box_index);
         leave();
@@ -1044,7 +1067,7 @@ public:
         }
 
         size_t box_index = (key - lower_bound) / box_key_range;
-        DeleteResult result = boxes[box_index].deleteKey(key);
+        DeleteResult result = (first_box_ptr + box_index)->deleteKey(key);
         leave();
         return result;
     }
@@ -1059,24 +1082,23 @@ public:
         }
 
         size_t box_index = (key - lower_bound) / box_key_range;
-        SearchResult result = boxes[box_index].searchKey(key);
-        //leave();
-        return result;
+        // SearchResult result = boxes[box_index].searchKey(key);
+        // //leave();
+        // return result;
+        return (first_box_ptr + box_index)->searchKey(key);
     }
 
     vector<pair<KeyType, ValueType>> prepare_for_split_stage1(int32_t merge_start, int32_t merge_end) {
-        // Pre-calculate total size to avoid reallocations
         size_t total_size = 0;
         vector<pair<KeyType, ValueType>> mergedEntries;
 
-        // Pre-calculate positions for each selected box
         int32_t start_box = std::max(0, merge_start);
-        int32_t end_box = std::min(merge_end, static_cast<int32_t>(boxes.size()) - 1);
+        int32_t end_box = std::min(merge_end, static_cast<int32_t>(active_box_count) - 1);
         if (start_box > end_box) return mergedEntries;
 
         std::vector<size_t> box_start_positions(static_cast<size_t>(end_box - start_box + 2), 0);
         for (int i = start_box; i <= end_box; i++) {
-            size_t box_size = boxes[i].getTotalCount();
+            size_t box_size = (first_box_ptr + i)->getTotalCount();
             box_start_positions[(i - start_box) + 1] = box_start_positions[(i - start_box)] + box_size;
             total_size += box_size;
         }
@@ -1084,7 +1106,7 @@ public:
 
         for (int i = start_box; i <= end_box; i++) {
             size_t start_pos = box_start_positions[i - start_box];
-            boxes[i].getEntriesInPlace(&mergedEntries, start_pos);
+            (first_box_ptr + i)->getEntriesInPlace(&mergedEntries, start_pos);
 #ifdef SORT_BOX
             size_t end_pos = box_start_positions[(i - start_box) + 1];
             if (end_pos > start_pos) {
@@ -1102,22 +1124,12 @@ public:
     vector<pair<KeyType, ValueType>> getBoxRangeEntries(int start_box, int end_box) const {
         vector<pair<KeyType, ValueType>> entries;
         int safe_start = std::max(0, start_box);
-        int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
+        int safe_end = std::min(end_box, static_cast<int>(active_box_count) - 1);
         for (int i = safe_start; i <= safe_end; i++) {
-            auto box_entries = boxes[i].getEntries();
+            auto box_entries = (first_box_ptr + i)->getEntries();
             entries.insert(entries.end(), box_entries.begin(), box_entries.end());
         }
         return entries;
-    }
-
-    vector<Box<KeyType, ValueType>> getPreservedBoxes(int start_box, int end_box) const {
-        vector<Box<KeyType, ValueType>> preserved;
-        int safe_start = std::max(0, start_box);
-        int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
-        for (int i = safe_start; i <= safe_end; i++) {
-            preserved.push_back(boxes[i]);
-        }
-        return preserved;
     }
 
     KeyType getBoxLower(int box_index) const {
@@ -1132,15 +1144,25 @@ public:
     KeyType getLowerBound() const { return lower_bound; }
     KeyType getUpperBound() const { return upper_bound; }
     size_t getBoxKeyRange() const { return box_key_range; }
-    size_t getBoxCount() const { return boxes.size(); }
+    size_t getBoxCount() const { return active_box_count; }
 
     vector<pair<KeyType, ValueType>> getAllEntries() const {
         vector<pair<KeyType, ValueType>> entries;
-        for (const auto& box : boxes) {
-            vector<pair<KeyType, ValueType>> be = box.getEntries();
+        for (size_t i = 0; i < active_box_count; i++) {
+            vector<pair<KeyType, ValueType>> be = (first_box_ptr + i)->getEntries();
             entries.insert(entries.end(), be.begin(), be.end());
         }
         return entries;
+    }
+
+    Box<KeyType, ValueType>* getBoxPtr(size_t index) {
+        return first_box_ptr + index;
+    }
+
+    void resetBoxes(Box<KeyType, ValueType>* new_first_box, size_t new_count) {
+        first_box_ptr = new_first_box;
+        active_box_count = new_count;
+        numBoxes = new_count;
     }
 };
 
@@ -1166,7 +1188,7 @@ private:
     // mutable std::mutex split_queue_mutex_;
     std::atomic<bool> critical_section_lock_{false};
 
-    std::atomic<bool> is_segment_splitting_{false};
+    // std::atomic<bool> is_segment_splitting_{false};
     static ThreadLocalWaitTimingStats is_segment_splitting_insert_wait_stats_;
     static ThreadLocalWaitTimingStats is_segment_splitting_delete_wait_stats_;
     static ThreadLocalWaitTimingStats is_segment_splitting_search_wait_stats_;
@@ -1286,7 +1308,7 @@ public:
             }
 
             target_segment = segments[seg_index];
-            result = target_segment->insertKeyValue(key, value);
+            result = segments[seg_index]->insertKeyValue(key, value);
             if (result.status == InsertStatus::SUCCESS) {
                 return result;
             }
@@ -1305,14 +1327,15 @@ public:
             //     split_waiting_queue_.push(seg_index);
             // }
             goto retry_insert;
-        } else if (result.status == InsertStatus::SPLIT ||
-                   result.status == InsertStatus::OUT_OF_RANGE) {
+        } else if (result.status == InsertStatus::SPLIT) {
             auto wait_start = std::chrono::high_resolution_clock::now();
             target_segment->wait_for_split_completion();
             auto wait_end = std::chrono::high_resolution_clock::now();
             auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
             is_segment_splitting_insert_wait_stats_.record_wait(wait_duration);
             goto retry_insert;
+        } else if (result.status == InsertStatus::OUT_OF_RANGE) {
+            throw std::runtime_error("Unexpected OUT_OF_RANGE status in insertKeyValue");
         }
         return result;
     }
@@ -1327,11 +1350,11 @@ public:
             return deleteFromBoundaryBox(key, seg_index);
         }
 
+        DeleteResult ret = segments[seg_index]->deleteKey(key);
         Segment<KeyType, ValueType>* target_segment = segments[seg_index];
-        DeleteResult ret = target_segment->deleteKey(key);
         if (ret.status == DeleteStatus::SPLIT || ret.status == DeleteStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
-            is_segment_splitting_.wait(true, std::memory_order_acquire);
+            target_segment->wait_for_split_completion();
             auto wait_end = std::chrono::high_resolution_clock::now();
             auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
             is_segment_splitting_delete_wait_stats_.record_wait(wait_duration);
@@ -1351,8 +1374,8 @@ public:
             return searchInBoundaryBox(key, seg_index);
         }
 
+        SearchResult<KeyType, ValueType> ret = segments[seg_index]->searchKey(key);
         Segment<KeyType, ValueType>* target_segment = segments[seg_index];
-        SearchResult<KeyType, ValueType> ret = target_segment->searchKey(key);
         if (ret.status == SearchStatus::SPLIT || ret.status == SearchStatus::OUT_OF_RANGE) {
             auto wait_start = std::chrono::high_resolution_clock::now();
             target_segment->wait_for_split_completion();
@@ -1378,7 +1401,9 @@ public:
         }
     }
 
-    void inPlaceReplaceSegment(Segment<KeyType, ValueType>* old_segment_ptr, std::vector<Segment<KeyType, ValueType>*> new_segments) {        
+    void inPlaceReplaceSegment(Segment<KeyType, ValueType>* old_segment_ptr, 
+                        std::vector<Segment<KeyType, ValueType>*> new_segments,
+                        std::vector<KeyType>& new_segment_start_keys) {        
         int start_pos = -1;
         int end_pos = -1;
         for (size_t i = 0; i < segments.size(); i++) {
@@ -1392,10 +1417,10 @@ public:
             int new_seg_index = i - start_pos;
             if (new_seg_index < static_cast<int>(new_segments.size())) {
                 segments[i] = new_segments[new_seg_index];
-                segment_start_keys[i] = new_segments[new_seg_index]->getLowerBound();
+                segment_start_keys[i] = new_segment_start_keys[new_seg_index];
             } else {
                 segments[i] = new_segments.back();
-                segment_start_keys[i] = new_segments.back()->getLowerBound();
+                segment_start_keys[i] = new_segment_start_keys.back();
             }
         }
                 
@@ -1407,7 +1432,7 @@ public:
 
         auto t1 = std::chrono::high_resolution_clock::now();
         auto* segment = segment_ptr;
-        cout << "num boxes: " << segment->boxes.size() << endl;
+        cout << "num boxes: " << segment->getBoxCount() << endl;
         auto t2 = std::chrono::high_resolution_clock::now();
 
         // Wait for all ongoing operations to complete
@@ -1481,80 +1506,51 @@ public:
         bool has_left = (merge_start > 0);
         bool has_right = (merge_end < static_cast<int>(numBoxes) - 1);
 
+        Box<KeyType, ValueType>* original_boxes = segment->getBoxPtr(0);
+        KeyType original_upper_bound = segment->getUpperBound();
+
         // Initialize timing variables to avoid uninitialized access
         std::chrono::high_resolution_clock::time_point t_right_start = std::chrono::high_resolution_clock::now();
         std::chrono::high_resolution_clock::time_point t_right_end = t_right_start;
         std::chrono::high_resolution_clock::time_point t_left_start = std::chrono::high_resolution_clock::now();
         std::chrono::high_resolution_clock::time_point t_left_end = t_left_start;
 
-        // Process right segment first to preserve original segment data integrity
-        Segment<KeyType, ValueType>* right_segment = nullptr;
-        if (has_right) {
-            t_right_start = std::chrono::high_resolution_clock::now();
             
-            if (!has_left) {
-                // Only right segment exists, reuse original segment in-place
-                right_segment = segment;
-                KeyType new_lower = segment->getBoxLower(merge_end + 1);
-                right_segment->lower_bound = new_lower;
-                
-                // Remove boxes that don't belong to right segment
-                if (merge_end + 1 < static_cast<int>(numBoxes)) {
-                    right_segment->boxes.erase(
-                        right_segment->boxes.begin(),
-                        right_segment->boxes.begin() + merge_end + 1
-                    );
-                    right_segment->numBoxes = numBoxes - (merge_end + 1);
-                } else {
-                    // Edge case: no boxes to preserve
-                    right_segment->boxes.clear();
-                    right_segment->numBoxes = 0;
-                }
-            } else {
-                // Left segment exists, need to create new right segment
-                KeyType right_lower = segment->getBoxLower(merge_end + 1);
-                KeyType right_upper = segment->getUpperBound();
-                right_segment = new Segment<KeyType, ValueType>(
-                    right_lower, right_upper, segment->getBoxKeyRange(), thread_num
-                );
-                
-                // Copy boxes from original segment (data is still intact at this point)
-                right_segment->boxes.clear();
-                if (merge_end + 1 < static_cast<int>(numBoxes)) {
-                    int right_box_count = numBoxes - (merge_end + 1);
-                    right_segment->boxes.reserve(right_box_count);
-                    for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
-                        right_segment->boxes.push_back(segment->boxes[i]);
-                    }
-                    right_segment->numBoxes = right_box_count;
-                } else {
-                    right_segment->numBoxes = 0;
-                }
-            }
-            
-            t_right_end = std::chrono::high_resolution_clock::now();
-        }
-
-        // Process left segment after right (safe to modify original segment in-place now)
         Segment<KeyType, ValueType>* left_segment = nullptr;
+        Segment<KeyType, ValueType>* right_segment = nullptr;
         if (has_left) {
             t_left_start = std::chrono::high_resolution_clock::now();
             
-            // Reuse original segment as left segment in-place
             left_segment = segment;
-            KeyType new_upper = segment->getBoxUpper(merge_start - 1);
-            left_segment->upper_bound = new_upper;
-            
-            // Remove boxes that don't belong to left segment
-            if (merge_start < static_cast<int>(numBoxes)) {
-                left_segment->boxes.erase(
-                    left_segment->boxes.begin() + merge_start,
-                    left_segment->boxes.end()
-                );
-                left_segment->numBoxes = merge_start;
-            }
+            left_segment->upper_bound = segment->getBoxUpper(merge_start - 1);
+            left_segment->resetBoxes(original_boxes, merge_start);
             
             t_left_end = std::chrono::high_resolution_clock::now();
+        }
+
+        if (has_right) {
+            t_right_start = std::chrono::high_resolution_clock::now();
+            
+            if (has_left) {
+                KeyType right_lower = segment->getBoxLower(merge_end + 1);
+                Box<KeyType, ValueType>* right_boxes = original_boxes + (merge_end + 1);
+                size_t right_box_count = numBoxes - (merge_end + 1);
+                
+                right_segment = new Segment<KeyType, ValueType>(
+                    right_lower, original_upper_bound, segment->getBoxKeyRange(), thread_num,
+                    right_boxes, right_box_count
+                );
+            } else {
+                right_segment = segment;
+                KeyType right_lower = segment->getBoxLower(merge_end + 1);
+                Box<KeyType, ValueType>* right_boxes = original_boxes + (merge_end + 1);
+                size_t right_box_count = numBoxes - (merge_end + 1);
+                
+                right_segment->lower_bound = right_lower;
+                right_segment->resetBoxes(right_boxes, right_box_count);
+            }
+            
+            t_right_end = std::chrono::high_resolution_clock::now();
         }
 
         // Assemble new_segments in logical order: left → merged → right
@@ -1577,21 +1573,13 @@ public:
         size_t new_segments_size = new_segments.size();
         acquire_critical_section();
         // Replace old segment with new segments in the global structure
-        inPlaceReplaceSegment(segment, new_segments);
+        inPlaceReplaceSegment(segment, new_segments, new_segment_start_keys);
         auto t10 = std::chrono::high_resolution_clock::now();
-
-        // Memory management: only delete original segment if it's not reused
-        if (!has_left && !has_right) {
-            // Entire segment was rebuilt, delete original segment
-            delete segment;
-        }
+        
         // If has_left is true, original segment is reused as left_segment, no delete needed
         // If only has_right is true and has_left is false, original segment is reused as right_segment, no delete needed
         segment->unmark_splitting();
         segment->splitting_.store(false, std::memory_order_release);
-        // Signal completion of splitting operation
-        is_segment_splitting_.store(false, std::memory_order_release);
-        is_segment_splitting_.notify_all();
         auto t11 = std::chrono::high_resolution_clock::now();
 
         // Release global splitting lock
