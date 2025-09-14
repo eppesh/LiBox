@@ -49,5 +49,11 @@ graph_debug:
 segment_debug:
 	$(CXX) $(MAC_DEBUG_FLAGS) src/segmentation.cpp -o segmentation_debug
 
+count-key:
+	$(CXX) $(MAC_RELEASE_FLAGS) -pthread count-key.cpp -o count-key
+
+count-key_debug:
+	$(CXX) $(MAC_DEBUG_FLAGS) -pthread count-key.cpp -o count-key_debug
+
 clean:
-	rm -f $(TARGET) $(TARGET)_debug $(TARGET)_prof partition_optimization partition_optimization_debug ratio_by_win ratio_by_win_debug seg_len_by_win seg_len_by_win_debug segmentation segmentation_debug
+	rm -f $(TARGET) $(TARGET)_debug $(TARGET)_prof partition_optimization partition_optimization_debug ratio_by_win ratio_by_win_debug seg_len_by_win seg_len_by_win_debug segmentation segmentation_debug count-key count-key_debug

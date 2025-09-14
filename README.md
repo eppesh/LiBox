@@ -239,6 +239,58 @@ The `sample/` directory contains example files for quick testing:
    ./test/benchmark --keys_file=sample/sample_keys.txt --config_file_path=sample/sample_config.csv --keys_file_type=text --init_num_keys=1000 --total_num_keys=2000
    ```
 
+## Key Distribution Analysis Tools
+
+LiBox includes powerful tools for analyzing key distribution patterns in your datasets, which is crucial for optimizing segment configurations.
+
+### count-key.cpp - High-Performance Bucket Counter
+
+A multi-threaded C++ program for efficient key distribution analysis:
+
+```bash
+# Build the count-key binary
+make count-key
+
+# Analyze key distribution
+./count-key <csv_file> <min_key> <max_key> <num_buckets> [output_file]
+```
+
+**Parameters**:
+- `csv_file`: Path to CSV file containing numeric keys (one per line)
+- `min_key`: Minimum key value for bucket partitioning
+- `max_key`: Maximum key value for bucket partitioning
+- `num_buckets`: Number of equal-width buckets to create
+- `output_file`: Optional output file (default: `bucket_data.csv`)
+
+**Example**:
+```bash
+./count-key longitudes.csv -1800000000 1800000000 1000
+```
+
+### get-key-dist.py - Visualization and Analysis
+
+A Python script that uses count-key.cpp for efficient processing and provides rich visualizations:
+
+```bash
+# Run complete analysis with visualizations
+python3 get-key-dist.py <csv_file> <min_key> <max_key> [num_buckets]
+```
+**Example**:
+```bash
+make count-key
+python3 get-key-dist.py longitudes.csv -1800000000 1800000000 1000
+```
+
+**Output Files**:
+- `bucket_data.csv`: Raw bucket data for further analysis
+- `key_distribution.html`: Interactive charts viewable in web browser
+
+The hybrid C++/Python approach provides:
+- **C++ Backend**: Multi-threaded bucket counting with maximum performance
+- **Python Frontend**: Rich visualizations and statistical analysis
+- **Memory Efficient**: Streams data without loading entire datasets
+- **Scalable**: Handles very large files (2GB+) efficiently
+
 ## Performance Optimizations
 
 - **SIMD Acceleration**: AVX-512 instructions for parallel operations
@@ -246,3 +298,4 @@ The `sample/` directory contains example files for quick testing:
 - **Adaptive Resegmentation**: Dynamic load balancing
 - **Lock-Free Operations**: Atomic version control for high concurrency
 - **Intelligent Partitioning**: Data-driven segment optimization
+- **Hybrid Processing**: C++ for computation, Python for visualization
