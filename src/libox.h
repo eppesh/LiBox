@@ -600,7 +600,6 @@ class Box {
                 if (capacity == overflowCapacity) {
                     return {BoxInsertResult::FULL, 0, 0}; // No space left
                 }
-                data[capacity] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
                 data[capacity]->insert(key, value);
                 capacity++;
                 return {BoxInsertResult::INSERT, capacity, 0};
@@ -613,7 +612,9 @@ class Box {
 
    public:
     Box() : capacity(1) {
-        data[0] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
+        for (int i = 0; i < overflowCapacity; i++) {
+            data[i] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
+        }    
     }
 
     Box(const Box& other)
@@ -636,7 +637,7 @@ class Box {
                 break;
             }
         }
-        for (size_t i = 0; i < capacity; i++) {
+        for (size_t i = 0; i < overflowCapacity; i++) {
             if (other.data[i]) {
                 data[i] = other.data[i]->clone();
             }
@@ -666,7 +667,7 @@ class Box {
                     break;
                 }
             }
-            for (size_t i = 0; i < capacity; i++) {
+            for (size_t i = 0; i < overflowCapacity; i++) {
                 if (other.data[i]) {
                     data[i] = other.data[i]->clone();
                 }
@@ -689,7 +690,7 @@ class Box {
         version_lock_.store(other.version_lock_.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
 
-        for (size_t i = 0; i < capacity; i++) {
+        for (size_t i = 0; i < overflowCapacity; i++) {
             data[i] = std::move(other.data[i]);
         }
     }
