@@ -64,15 +64,15 @@ count-key_debug:
 	$(CXX) $(MAC_DEBUG_FLAGS) -pthread count-key.cpp -o count-key_debug
 
 # Gen worst case test targets
-gen_worst_case: test/gen_worst_case
+gen-worst-case: test/gen-worst-case
 
-test/gen_worst_case: test/gen-worst-case.cpp
-	$(CXX) -O3 $(COMMON_FLAGS) -DNDEBUG test/gen-worst-case.cpp -o test/gen_worst_case
+test/gen-worst-case: test/gen-worst-case.cpp
+	$(CXX) -O3 $(COMMON_FLAGS) -DNDEBUG test/gen-worst-case.cpp -o test/gen-worst-case
 
-gen_worst_case_debug: test/gen_worst_case_debug
+gen-worst-case_debug: test/gen-worst-case_debug
 
-test/gen_worst_case_debug: test/gen-worst-case.cpp
-	$(CXX) -O0 -g $(COMMON_FLAGS) test/gen-worst-case.cpp -o test/gen_worst_case_debug
+test/gen-worst-case_debug: test/gen-worst-case.cpp
+	$(CXX) -O0 -g $(COMMON_FLAGS) test/gen-worst-case.cpp -o test/gen-worst-case_debug
 
 clean:
 	rm -f $(TARGET) $(TARGET)_debug $(TARGET)_prof partition_optimization partition_optimization_debug ratio_by_win ratio_by_win_debug seg_len_by_win seg_len_by_win_debug segmentation segmentation_debug count-key count-key_debug

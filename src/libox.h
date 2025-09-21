@@ -1245,7 +1245,7 @@ public:
                 unique_segments.insert(seg);
             }
         }
-        
+
         for (auto* seg : unique_segments) {
             delete seg;
         }
@@ -1302,7 +1302,7 @@ public:
         int retry_count = 0;
 
     retry_delete:
-        int32_t seg_index = searchIndex(key); 
+        int32_t seg_index = searchIndex(key);
         if (seg_index < 0) {
             cout << "Deleting from boundary box for key: " << key << endl;
             return deleteFromBoundaryBox(key, seg_index);
@@ -1325,7 +1325,7 @@ public:
         int retry_count = 0;
 
     retry_search:
-        int32_t seg_index = searchIndex(key); 
+        int32_t seg_index = searchIndex(key);
         if (seg_index < 0) {
             cout << "Searching in boundary box for key: " << key << endl;
             return searchInBoundaryBox(key, seg_index);
@@ -1359,7 +1359,7 @@ public:
 
     void inPlaceReplaceSegment(int32_t old_seg_idx, std::vector<Segment<KeyType, ValueType>*> new_segments) {
         Segment<KeyType, ValueType>* old_segment = segments[old_seg_idx];
-        
+
         int start_pos = -1;
         int end_pos = -1;
         for (size_t i = 0; i < segments.size(); i++) {
@@ -1368,7 +1368,7 @@ public:
                 end_pos = i;
             }
         }
-        
+
         for (int i = start_pos; i <= end_pos; i++) {
             int new_seg_index = i - start_pos;
             if (new_seg_index < static_cast<int>(new_segments.size())) {
@@ -1379,7 +1379,7 @@ public:
                 segment_start_keys[i] = new_segments.back()->getLowerBound();
             }
         }
-                
+
         buildSearchIndex();
     }
 
@@ -1579,26 +1579,26 @@ public:
 
     void insertEmptySlots(int empty_slots_between = 3) {
         if (segments.empty()) return;
-        
+
         std::vector<Segment<KeyType, ValueType>*> new_segments;
         std::vector<KeyType> new_start_keys;
-        
+
         for (size_t i = 0; i < segments.size(); i++) {
             new_segments.push_back(segments[i]);
             new_start_keys.push_back(segment_start_keys[i]);
-            
+
             if (i < segments.size() - 1) {
                 KeyType current_start = segment_start_keys[i];
-                
+
                 for (int j = 1; j <= empty_slots_between; j++) {
                     new_segments.push_back(segments[i]);
                     new_start_keys.push_back(current_start);
                 }
             }
         }
-        
+
         new_start_keys.push_back(segment_start_keys.back());
-        
+
         segments = std::move(new_segments);
         segment_start_keys = std::move(new_start_keys);
     }
@@ -1611,8 +1611,8 @@ public:
 
         size_t memory_bytes = redundantSize * sizeof(int32_t);
         std::cout << "redundantArray size: " << redundantSize << " elements" << std::endl;
-        std::cout << "redundantArray memory: " << memory_bytes << " bytes (" 
-                << (memory_bytes / 1024.0) << " KB, " 
+        std::cout << "redundantArray memory: " << memory_bytes << " bytes ("
+                << (memory_bytes / 1024.0) << " KB, "
                 << (memory_bytes / 1024.0 / 1024.0) << " MB)" << std::endl;
 
         a = static_cast<double>(redundantSize - 1) /
@@ -1646,24 +1646,24 @@ public:
 
         int64_t position = static_cast<int64_t>(a * key + b);
         int32_t estimatedIndex = redundantArray[position];
-            
+
         int32_t left_boundary = estimatedIndex;
-        while (left_boundary > 0 && 
+        while (left_boundary > 0 &&
             segment_start_keys[left_boundary - 1] == segment_start_keys[estimatedIndex]) {
             left_boundary--;
         }
-        
+
         int32_t right_boundary = estimatedIndex;
-        while (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) && 
+        while (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) &&
             segment_start_keys[right_boundary + 1] == segment_start_keys[estimatedIndex]) {
             right_boundary++;
         }
 
         KeyType current_key = segment_start_keys[estimatedIndex];
-        KeyType next_key = (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ? 
-                        segment_start_keys[right_boundary + 1] : 
+        KeyType next_key = (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ?
+                        segment_start_keys[right_boundary + 1] :
                         std::numeric_limits<KeyType>::max();
-        
+
         if (current_key <= key && key < next_key) {
             return estimatedIndex;
         }
@@ -1679,17 +1679,17 @@ public:
         } else { // key >= next_key
             if (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) {
                 int32_t next_index = right_boundary + 1;
-                
+
                 int32_t next_right_boundary = next_index;
-                while (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) && 
+                while (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) &&
                     segment_start_keys[next_right_boundary + 1] == segment_start_keys[next_index]) {
                     next_right_boundary++;
                 }
-                
-                KeyType next_next_key = (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ? 
-                                    segment_start_keys[next_right_boundary + 1] : 
+
+                KeyType next_next_key = (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ?
+                                    segment_start_keys[next_right_boundary + 1] :
                                     std::numeric_limits<KeyType>::max();
-                
+
                 if (segment_start_keys[next_index] <= key && key < next_next_key) {
                     return next_index;
                 }
@@ -1743,7 +1743,7 @@ public:
                 }
             }
         }
-        
+
         return -1;
     }
 

@@ -233,6 +233,7 @@ def plot_cdf(buckets, bucket_counts, cdf, num_buckets):
     if not MATPLOTLIB_AVAILABLE:
         print("Matplotlib not available, creating text-based visualization...")
         create_text_visualization(buckets, bucket_counts, cdf)
+        create_html_visualization(buckets, bucket_counts, cdf)
         save_data_to_csv(buckets, bucket_counts, cdf)
         return
 
