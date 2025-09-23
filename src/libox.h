@@ -1076,6 +1076,10 @@ public:
 
         if (result.status == InsertStatus::FULL) {
             if (target_segment->try_mark_for_splitting()) {
+                {
+                    std::lock_guard<std::mutex> lock(print_mutex_);
+                    cout << "Split " << seg_index << endl;
+                }
                 splitSegment(target_segment, result.box_index);
             }else {
                 exponential_backoff(retry_count++);
