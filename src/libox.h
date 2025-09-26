@@ -1081,10 +1081,10 @@ public:
                     cout << "Split " << seg_index << endl;
                     #ifndef NDEBUG
                     // print the bounds of the segments before and after the split
-                    cout << "Before split: seg[" << seg_index - 1 << "]=(" << segments[seg_index - 1]->getLowerBound() << ", " << segments[seg_index - 1]->getUpperBound() << ")"
-                         << ", seg[" << seg_index << "]=(" << target_segment->getLowerBound() << ", " << target_segment->getUpperBound() << ")"
-                         << ", seg[" << seg_index + 1 << "]=(" << segments[seg_index + 1]->getLowerBound() << ", " << segments[seg_index + 1]->getUpperBound() << ")"
-                         << endl;
+                    cout << "Before split: " << endl;
+                    for (int i = seg_index; i < seg_index + 10; i++) {
+                        cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
+                    }
                     #endif
                 }
                 splitSegment(target_segment, result.box_index);
@@ -1377,19 +1377,19 @@ public:
                 KeyType prev_upper = merged_segments[i-1]->getUpperBound();
                 KeyType curr_lower = merged_segments[i]->getLowerBound();
                 assert(prev_upper == curr_lower && "Gap detected between adjacent segments");
-                cout << "merged[" << i-1 << "]->getUpperBound()=" << prev_upper << ", merged[" << i << "]->getLowerBound()=" << curr_lower << endl;
+                cout << "merged[" << i-1 << "]->upper=" << prev_upper << ", merged[" << i << "]->lower=" << curr_lower << endl;
             }
             if (i == 0 && has_left) {
                 KeyType left_upper = left_segment->getUpperBound();
                 KeyType curr_lower = merged_segments[i]->getLowerBound();
                 assert(left_upper == curr_lower && "Gap detected between left and first merged segment");
-                cout << "left_segment->getUpperBound()=" << left_upper << ", merged[" << i << "]->getLowerBound()=" << curr_lower << endl;
+                cout << "left->lower" << left_segment->getLowerBound() << ", left->upper=" << left_upper << ", merged[" << i << "]->lower=" << curr_lower << endl;
             }
             if (i == merged_segments.size()-1 && has_right) {
                 KeyType curr_upper = merged_segments[i]->getUpperBound();
                 KeyType right_lower = right_segment->getLowerBound();
                 assert(curr_upper == right_lower && "Gap detected between last merged and right segment");
-                cout << "merged[" << i << "]->getUpperBound()=" << curr_upper << ", right_segment->getLowerBound()=" << right_lower << " upper_bound=" << right_segment->getUpperBound() << endl;
+                cout << "merged[" << i << "]->upper=" << curr_upper << ", right->lower=" << right_lower << " upper=" << right_segment->getUpperBound() << endl;
             }
             #endif
         }
