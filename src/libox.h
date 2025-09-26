@@ -1079,8 +1079,25 @@ public:
                 {
                     std::lock_guard<std::mutex> lock(print_mutex_);
                     cout << "Split " << seg_index << endl;
+                    #ifndef NDEBUG
+                    // print the bounds of the segments before and after the split
+                    cout << "Before split: seg[" << seg_index - 1 << "]=(" << segments[seg_index - 1]->getLowerBound() << ", " << segments[seg_index - 1]->getUpperBound() << ")"
+                         << ", seg[" << seg_index << "]=(" << target_segment->getLowerBound() << ", " << target_segment->getUpperBound() << ")"
+                         << ", seg[" << seg_index + 1 << "]=(" << segments[seg_index + 1]->getLowerBound() << ", " << segments[seg_index + 1]->getUpperBound() << ")"
+                         << endl;
+                    #endif
                 }
                 splitSegment(target_segment, result.box_index);
+                {
+                    std::lock_guard<std::mutex> lock(print_mutex_);
+                    #ifndef NDEBUG
+                    // print 10 segments from seg_index to seg_index + 10
+                    cout << "After split: " << endl;
+                    for (int i = seg_index; i < seg_index + 10; i++) {
+                        cout << "seg[" << i << "]=(" << segments[i]->getLowerBound() << ", " << segments[i]->getUpperBound() << ")" << endl;
+                    }
+                    #endif
+                }
             }else {
                 exponential_backoff(retry_count++);
                 goto retry_insert;
@@ -1098,7 +1115,8 @@ public:
                 std::lock_guard<std::mutex> lock(print_mutex_);
                 cout << "Out-of-range: segidx=" << seg_index << ", total_segments="
                      << segments.size() << ", key=" << key
-                     << ", bounds=(" << target_segment->getLowerBound() << ", " << target_segment->getUpperBound() << ")"
+                     << ", prevSegBounds=(" << segments[seg_index - 1]->getLowerBound() << ", " << segments[seg_index - 1]->getUpperBound() << ")"
+                     << ", currSegBounds=(" << segments[seg_index]->getLowerBound() << ", " << segments[seg_index]->getUpperBound() << ")"
                      << ", nextSegBounds=(" << segments[seg_index + 1]->getLowerBound() << ", " << segments[seg_index + 1]->getUpperBound() << ")"
                      << endl;
             }
@@ -1352,6 +1370,28 @@ public:
         for (size_t i = 0; i < merged_segments.size(); i++) {
             new_segments.push_back(merged_segments[i]);
             new_segment_start_keys.push_back(merged_segments[i]->getLowerBound());
+
+            #ifndef NDEBUG
+            // Check no gap between adjacent segments
+            if (i > 0) {
+                KeyType prev_upper = merged_segments[i-1]->getUpperBound();
+                KeyType curr_lower = merged_segments[i]->getLowerBound();
+                assert(prev_upper == curr_lower && "Gap detected between adjacent segments");
+                cout << "merged[" << i-1 << "]->getUpperBound()=" << prev_upper << ", merged[" << i << "]->getLowerBound()=" << curr_lower << endl;
+            }
+            if (i == 0 && has_left) {
+                KeyType left_upper = left_segment->getUpperBound();
+                KeyType curr_lower = merged_segments[i]->getLowerBound();
+                assert(left_upper == curr_lower && "Gap detected between left and first merged segment");
+                cout << "left_segment->getUpperBound()=" << left_upper << ", merged[" << i << "]->getLowerBound()=" << curr_lower << endl;
+            }
+            if (i == merged_segments.size()-1 && has_right) {
+                KeyType curr_upper = merged_segments[i]->getUpperBound();
+                KeyType right_lower = right_segment->getLowerBound();
+                assert(curr_upper == right_lower && "Gap detected between last merged and right segment");
+                cout << "merged[" << i << "]->getUpperBound()=" << curr_upper << ", right_segment->getLowerBound()=" << right_lower << " upper_bound=" << right_segment->getUpperBound() << endl;
+            }
+            #endif
         }
 
         if (has_right) {
