@@ -160,9 +160,9 @@ keySegment<KeyType> findBestSegment(const std::vector<KeyType>& data,
         }
     }
 #ifndef NDEBUG
-    if (best_seg.cum_keys < BOX_CAPACITY) {
-        std::cout << "not good guys\n";
-    }
+    //if (best_seg.cum_keys < BOX_CAPACITY) {
+    //    std::cout << "not good guys\n";
+    //}
 #endif
     return best_seg;
 }

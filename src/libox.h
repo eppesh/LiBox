@@ -30,6 +30,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <unistd.h>  // for gettid()
+#include <sys/syscall.h>  // for SYS_gettid
+
 #include "segmentation.h"
 
 #define SORT_BOX
@@ -57,6 +60,11 @@ using namespace std;
 namespace liboxns {
 
 void exponential_backoff(int retry_count);
+
+// Helper function to get system thread ID (the one shown in GDB)
+inline pid_t get_system_thread_id() {
+    return syscall(SYS_gettid);
+}
 
 
 class ThreadIdManager {
@@ -430,7 +438,7 @@ class Box {
         }
         return *this;
     }
-    
+
     ~Box() = default;
 
     bool hasEmptySlots() const {
@@ -500,7 +508,7 @@ class Box {
             exponential_backoff(retry_count++);
             goto retry_write;
         }
-        
+
         values[index] = value;
         uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
         version_lock_.store(new_version, std::memory_order_release);
@@ -651,7 +659,8 @@ private:
     size_t active_box_count;
 
 public:
-    KeyType lower_bound; 
+    int thread_id;
+    KeyType lower_bound;
     KeyType upper_bound;
     std::deque<std::atomic<uint8_t>> logical_box_write_positions;
     static constexpr size_t PHYSICAL_BOXES_PER_LOGICAL = 1 + overflowCapacity;
@@ -663,21 +672,21 @@ public:
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
           operation_counter_(thread_num), num_threads(thread_num) {
-        
+
         size_t total = upper - lower + 1;
         logical_box_count = total / box_range;
         if (total % box_range != 0) logical_box_count++;
-        
+
         physical_box_count = logical_box_count * PHYSICAL_BOXES_PER_LOGICAL;
         numBoxes = logical_box_count;
         active_box_count = logical_box_count;
-        
+
         first_box_ptr = new Box<KeyType, ValueType>[physical_box_count];
-        
+
         for (size_t i = 0; i < physical_box_count; i++) {
             new (&first_box_ptr[i]) Box<KeyType, ValueType>();
         }
-        
+
         logical_box_write_positions.resize(logical_box_count);
         for (size_t i = 0; i < logical_box_count; i++) {
             logical_box_write_positions[i].store(0, std::memory_order_relaxed);
@@ -688,13 +697,13 @@ public:
             Box<KeyType, ValueType>* existing_boxes, size_t logical_count, bool take_ownership = false)
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
           operation_counter_(thread_num), num_threads(thread_num) {
-        
+
         logical_box_count = logical_count;
         physical_box_count = logical_count * PHYSICAL_BOXES_PER_LOGICAL;
         numBoxes = logical_count;
         active_box_count = logical_count;
         first_box_ptr = existing_boxes;
-        
+
         logical_box_write_positions.resize(logical_box_count);
         for (size_t i = 0; i < logical_box_count; i++) {
             logical_box_write_positions[i].store(0, std::memory_order_relaxed);
@@ -747,19 +756,36 @@ public:
 
     bool try_mark_for_splitting() {
         bool expected = false;
-        return is_splitting_.compare_exchange_strong(
+        bool result = is_splitting_.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+#ifndef NDEBUG
+        if (result) {
+            thread_id = ThreadIdManager::get_thread_id();
+            std::cout << "[DEBUG] Thread " << thread_id
+                      << " (sys_tid=" << get_system_thread_id() << ")"
+                      << " set is_splitting_ to TRUE in try_mark_for_splitting() for segment ("
+                      << lower_bound << ", " << upper_bound << ")" << std::endl;
+        }
+#endif
+        return result;
     }
-    
+
     void unmark_splitting() {
+#ifndef NDEBUG
+        thread_id = ThreadIdManager::get_thread_id();
+        std::cout << "[DEBUG] Thread " << thread_id
+                  << " (sys_tid=" << get_system_thread_id() << ")"
+                  << " set is_splitting_ to FALSE in unmark_splitting() for segment ("
+                  << lower_bound << ", " << upper_bound << ")" << std::endl;
+#endif
         is_splitting_.store(false, std::memory_order_release);
         is_splitting_.notify_all();
     }
-    
+
     bool is_currently_splitting() const {
         return is_splitting_.load(std::memory_order_acquire);
     }
-    
+
     void wait_for_split_completion() const {
         is_splitting_.wait(true, std::memory_order_acquire);
     }
@@ -798,7 +824,7 @@ public:
 
         size_t logical_box_index = getLogicalBoxIndex(key);
         uint8_t current_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
-        
+
         uint8_t temp = insert_position;
         for (uint8_t pos = 0; pos < current_position+1; pos++) {
             size_t index = (first_box_ptr + getPhysicalBoxIndex(logical_box_index, pos))->searchUpdateKey(key);
@@ -844,7 +870,7 @@ public:
 
         size_t logical_box_index = getLogicalBoxIndex(key);
         uint8_t max_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
-        
+
         for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
             size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
             DeleteResult result = (first_box_ptr + physical_box_index)->deleteKey(key);
@@ -853,7 +879,7 @@ public:
                 return {DeleteStatus::SUCCESS, true};
             }
         }
-        
+
         leave();
         return {DeleteStatus::NOT_FOUND, false};
     }
@@ -861,16 +887,16 @@ public:
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
         size_t logical_box_index = getLogicalBoxIndex(key);
         uint8_t max_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
-        
+
         for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
             size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
-            
+
             SearchResult<KeyType, ValueType> result = (first_box_ptr + physical_box_index)->searchKey(key);
             if (result.status == SearchStatus::SUCCESS) {
                 return result;
             }
         }
-        
+
         return {SearchStatus::NOT_FOUND, -1};
     }
 
@@ -883,34 +909,34 @@ public:
 
         std::vector<size_t> box_start_positions(static_cast<size_t>(end_logical_box - start_logical_box + 2), 0);
         size_t total_size = 0;
-        
+
         for (int logical_idx = start_logical_box; logical_idx <= end_logical_box; logical_idx++) {
             size_t logical_box_size = 0;
             uint8_t max_position = logical_box_write_positions[logical_idx].load(std::memory_order_acquire);
-            
+
             for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
                 size_t physical_box_index = getPhysicalBoxIndex(logical_idx, pos);
                 logical_box_size += (first_box_ptr + physical_box_index)->getTotalCount();
             }
-            
-            box_start_positions[(logical_idx - start_logical_box) + 1] = 
+
+            box_start_positions[(logical_idx - start_logical_box) + 1] =
                 box_start_positions[(logical_idx - start_logical_box)] + logical_box_size;
             total_size += logical_box_size;
         }
-        
+
         mergedEntries.resize(total_size);
 
         for (int logical_idx = start_logical_box; logical_idx <= end_logical_box; logical_idx++) {
             size_t start_pos = box_start_positions[logical_idx - start_logical_box];
             size_t current_pos = start_pos;
             uint8_t max_position = logical_box_write_positions[logical_idx].load(std::memory_order_acquire);
-            
+
             for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
                 size_t physical_box_index = getPhysicalBoxIndex(logical_idx, pos);
                 (first_box_ptr + physical_box_index)->getEntriesInPlace(&mergedEntries, current_pos);
                 current_pos += (first_box_ptr + physical_box_index)->getTotalCount();
             }
-            
+
 #ifdef SORT_BOX
             size_t end_pos = box_start_positions[(logical_idx - start_logical_box) + 1];
             if (end_pos > start_pos) {
@@ -963,7 +989,7 @@ public:
         physical_box_count = new_logical_count * PHYSICAL_BOXES_PER_LOGICAL;
         active_box_count = new_logical_count;
         numBoxes = new_logical_count;
-        
+
         logical_box_write_positions.resize(logical_box_count);
         for (size_t i = 0; i < logical_box_count; i++) {
             logical_box_write_positions[i].store(0, std::memory_order_relaxed);
@@ -1064,7 +1090,7 @@ private:
         DeleteResult result = boundary_box->deleteKey(key);
         return result;
     }
-        
+
     void acquire_critical_section() {
         while (critical_section_lock_.exchange(true, std::memory_order_acquire)) {
             while (critical_section_lock_.load(std::memory_order_relaxed)) {
@@ -1092,7 +1118,7 @@ public:
                 unique_segments.insert(seg);
             }
         }
-        
+
         for (auto* seg : unique_segments) {
             delete seg;
         }
@@ -1145,7 +1171,7 @@ public:
         int retry_count = 0;
 
     retry_delete:
-        int32_t seg_index = searchIndex(key); 
+        int32_t seg_index = searchIndex(key);
         if (seg_index < 0) {
             cout << "Deleting from boundary box for key: " << key << endl;
             return deleteFromBoundaryBox(key, seg_index);
@@ -1169,7 +1195,7 @@ public:
         int retry_count = 0;
 
     retry_search:
-        int32_t seg_index = searchIndex(key); 
+        int32_t seg_index = searchIndex(key);
         if (seg_index < 0) {
             cout << "Searching in boundary box for key: " << key << endl;
             return searchInBoundaryBox(key, seg_index);
@@ -1202,7 +1228,7 @@ public:
         }
     }
 
-    void inPlaceReplaceSegmentWithCompression(Segment<KeyType, ValueType>* old_segment_ptr, 
+    void inPlaceReplaceSegmentWithCompression(Segment<KeyType, ValueType>* old_segment_ptr,
                                             std::vector<Segment<KeyType, ValueType>*> new_segments,
                                             std::vector<KeyType>& new_segment_start_keys) {
 
@@ -1233,7 +1259,7 @@ public:
                 segments[current_old_positions[i]] = new_segments[i];
                 segment_start_keys[current_old_positions[i]] = new_segment_start_keys[i];
             }
-            
+
             for (size_t i = new_count; i < current_old_count; i++) {
                 segments[current_old_positions[i]] = new_segments.back();
                 segment_start_keys[current_old_positions[i]] = new_segment_start_keys.back();
@@ -1244,7 +1270,7 @@ public:
             std::vector<std::pair<Segment<KeyType, ValueType>*, KeyType>> effective_segments;
             std::set<Segment<KeyType, ValueType>*> seen_segments;
             size_t spaces_found = 0;
-            
+
             for (size_t i = last_old_pos + 1; i < segments.size() && spaces_found < strategy.backward_borrow; i++) {
                 if (segments[i] == old_segment_ptr) {
                     spaces_found++;
@@ -1255,12 +1281,12 @@ public:
                     seen_segments.insert(segments[i]);
                 }
             }
-            
+
             for (size_t i = 0; i < new_count; i++) {
                 segments[first_old_pos + i] = new_segments[i];
                 segment_start_keys[first_old_pos + i] = new_segment_start_keys[i];
             }
-            
+
             size_t placement_pos = first_old_pos + new_count;
             for (const auto& seg_info : effective_segments) {
                 if (placement_pos < segments.size()) {
@@ -1270,13 +1296,13 @@ public:
                 }
             }
         } else {
-            std::cout << "Using bidirectional borrowing: forward=" << strategy.forward_borrow 
+            std::cout << "Using bidirectional borrowing: forward=" << strategy.forward_borrow
                       << ", backward=" << strategy.backward_borrow << std::endl;
-            
+
             std::vector<std::pair<Segment<KeyType, ValueType>*, KeyType>> forward_effective_segments;
             std::set<Segment<KeyType, ValueType>*> forward_seen_segments;
             size_t forward_spaces_found = 0;
-            
+
             for (int i = first_old_pos - 1; i >= 0 && forward_spaces_found < strategy.forward_borrow; i--) {
                 if (segments[i] == old_segment_ptr) {
                     forward_spaces_found++;
@@ -1287,11 +1313,11 @@ public:
                     forward_seen_segments.insert(segments[i]);
                 }
             }
-            
+
             std::vector<std::pair<Segment<KeyType, ValueType>*, KeyType>> backward_effective_segments;
             std::set<Segment<KeyType, ValueType>*> backward_seen_segments;
             size_t backward_spaces_found = 0;
-            
+
             for (size_t i = last_old_pos + 1; i < segments.size() && backward_spaces_found < strategy.backward_borrow; i++) {
                 if (segments[i] == old_segment_ptr) {
                     backward_spaces_found++;
@@ -1302,11 +1328,11 @@ public:
                     backward_seen_segments.insert(segments[i]);
                 }
             }
-            
+
             int new_start_pos = first_old_pos - strategy.forward_borrow;
-        
+
             size_t placement_pos = new_start_pos;
-            
+
             for (const auto& seg_info : forward_effective_segments) {
                 if (placement_pos >= 0 && placement_pos < segments.size()) {
                     segments[placement_pos] = seg_info.first;
@@ -1322,7 +1348,7 @@ public:
                     placement_pos++;
                 }
             }
-            
+
             for (const auto& seg_info : backward_effective_segments) {
                 if (placement_pos < segments.size()) {
                     segments[placement_pos] = seg_info.first;
@@ -1331,7 +1357,7 @@ public:
                 }
             }
         }
-        
+
         buildSearchIndex();
     }
 
@@ -1340,13 +1366,13 @@ public:
         size_t forward_borrow;
         size_t backward_borrow;
         bool needs_compression;
-        
+
         CompressionStrategy() : is_feasible(false), forward_borrow(0), backward_borrow(0), needs_compression(false) {}
-        CompressionStrategy(bool feasible, size_t forward, size_t backward, bool compression) 
+        CompressionStrategy(bool feasible, size_t forward, size_t backward, bool compression)
             : is_feasible(feasible), forward_borrow(forward), backward_borrow(backward), needs_compression(compression) {}
     };
 
-    size_t countBackwardAvailableSpace(int last_old_pos, 
+    size_t countBackwardAvailableSpace(int last_old_pos,
             Segment<KeyType, ValueType>* old_segment_ptr,
             const std::vector<Segment<KeyType, ValueType>*>& segments,
         size_t max_needed = SIZE_MAX) {
@@ -1366,7 +1392,7 @@ public:
         return available_space;
     }
 
-    size_t countForwardAvailableSpace(int first_old_pos, 
+    size_t countForwardAvailableSpace(int first_old_pos,
                 Segment<KeyType, ValueType>* old_segment_ptr,
                 const std::vector<Segment<KeyType, ValueType>*>& segments,
                 size_t max_needed = SIZE_MAX) {
@@ -1393,22 +1419,22 @@ public:
                 current_positions.push_back(i);
             }
         }
-        
+
         if (current_positions.empty()) {
             return CompressionStrategy();
         }
-        
+
         size_t current_available = current_positions.size();
-        
+
         if (new_segments_count <= current_available) {
             return CompressionStrategy(true, 0, 0, false);
         }
-        
+
         size_t extra_needed = new_segments_count - current_available;
-        
+
         int last_old_pos = current_positions.back();
         size_t backward_space = countBackwardAvailableSpace(last_old_pos, old_segment_ptr, segments, extra_needed);
-        
+
         if (extra_needed <= backward_space) {
             return CompressionStrategy(true, 0, extra_needed, true);
         }
@@ -1416,19 +1442,19 @@ public:
         size_t remaining_needed = extra_needed - backward_space;
         int first_old_pos = current_positions.front();
         size_t forward_space = countForwardAvailableSpace(first_old_pos, old_segment_ptr, segments, remaining_needed);
-        
+
         size_t total_available_space = backward_space + forward_space;
 
         if (extra_needed <= total_available_space) {
             return CompressionStrategy(true, remaining_needed, backward_space, true);
         }
-        
+
         return CompressionStrategy();
     }
 
     void splitSegment(Segment<KeyType, ValueType>* segment_ptr, int box_index) {
         auto* segment = segment_ptr;
-        
+
         segment->wait_for_operations();
 
         size_t numLogicalBoxes = segment->getBoxCount();
@@ -1442,15 +1468,15 @@ public:
         std::vector<keySegment<KeyType>> keysegments;
         std::vector<StructSegment<KeyType>> final_segments;
         std::vector<Segment<KeyType, ValueType>*> merged_segments;
-        
+
         {
             int left_count = NUM_BOXES_TO_LOOK;
             int right_count = NUM_BOXES_TO_LOOK;
             merge_start = std::max(0, box_index - left_count);
             merge_end = std::min(static_cast<int>(numLogicalBoxes) - 1, box_index + right_count);
-            
+
             mergedEntries = segment->prepare_for_split_stage1(merge_start, merge_end);
-            
+
             if (!mergedEntries.empty()) {
                 vector<KeyType> keys;
                 keys.reserve(mergedEntries.size());
@@ -1462,10 +1488,10 @@ public:
                 KeyType merged_upper = segment->getBoxUpper(merge_end);
 
                 keysegments = calculateSegments(keys, 0.3, 0.5, 15, merged_lower, merged_upper);
-                
+
                 if (keysegments.size() <= 7) {
                     final_segments = toStructSegment(keysegments);
-                    
+
                     merged_segments.reserve(final_segments.size());
                     for (const auto& struct_seg : final_segments) {
                         auto* new_seg = new Segment<KeyType, ValueType>(
@@ -1474,16 +1500,16 @@ public:
                         merged_segments.push_back(new_seg);
                     }
                     populateSegmentsSerial(mergedEntries, merged_segments);
-                    
+
                     bool has_left = (merge_start > 0);
                     bool has_right = (merge_end < static_cast<int>(numLogicalBoxes) - 1);
                     size_t total_new_segments = merged_segments.size();
                     if (has_left) total_new_segments++;
                     if (has_right) total_new_segments++;
-                    
+
                     goto executeReplacement;
                 }
-                std::cout << "Local split produced too many segments (" << keysegments.size() 
+                std::cout << "Local split produced too many segments (" << keysegments.size()
                 << ") or insufficient space, falling back to full segment split" << std::endl;
             }
 
@@ -1497,27 +1523,35 @@ public:
             merge_start = 0;
             merge_end = static_cast<int>(numLogicalBoxes) - 1;
             mergedEntries = segment->prepare_for_split_stage1(merge_start, merge_end);
-            
+
             if (mergedEntries.empty()) {
                 segment->unmark_splitting();
+#ifndef NDEBUG
+                segment->thread_id = ThreadIdManager::get_thread_id();
+                std::cout << "[DEBUG] Thread " << segment->thread_id
+                          << " (sys_tid=" << get_system_thread_id() << ")"
+                          << " set is_splitting_ to FALSE in splitSegment() (empty mergedEntries) for segment ("
+                          << segment->lower_bound << ", " << segment->upper_bound << ")" << std::endl;
+#endif
+                segment->splitting_.store(false, std::memory_order_release);
                 return;
             }
-            
+
             vector<KeyType> keys;
             keys.reserve(mergedEntries.size());
             for (const auto& entry : mergedEntries) {
                 keys.push_back(entry.first);
             }
-    
+
             KeyType merged_lower = segment->getBoxLower(merge_start);
             KeyType merged_upper = segment->getBoxUpper(merge_end);
-    
+
             keysegments = calculateSegments(keys, 0.1, 0.7, 25, merged_lower, merged_upper);
-            std::cout << "Full segment split with relaxed parameters produced " 
+            std::cout << "Full segment split with relaxed parameters produced "
                       << keysegments.size() << " segments" << std::endl;
-            
-            final_segments = toStructSegment(keysegments); 
-            
+
+            final_segments = toStructSegment(keysegments);
+
             merged_segments.reserve(final_segments.size());
             for (const auto& struct_seg : final_segments) {
                 auto* new_seg = new Segment<KeyType, ValueType>(
@@ -1526,10 +1560,10 @@ public:
                 merged_segments.push_back(new_seg);
             }
             populateSegmentsSerial(mergedEntries, merged_segments);
-            
+
             size_t total_new_segments = merged_segments.size();
         }
-    
+
     executeReplacement:
         std::vector<Segment<KeyType, ValueType>*> new_segments;
         std::vector<KeyType> new_segment_start_keys;
@@ -1537,25 +1571,25 @@ public:
         KeyType original_upper_bound = segment->getUpperBound();
 
         bool is_local_split = (merge_start > 0 || merge_end < static_cast<int>(numLogicalBoxes) - 1);
-        
+
         if (is_local_split) {
             bool has_left = (merge_start > 0);
             bool has_right = (merge_end < static_cast<int>(numLogicalBoxes) - 1);
-            
+
             if (has_left) {
                 Segment<KeyType, ValueType>* left_segment = segment;
                 left_segment->upper_bound = segment->getBoxUpper(merge_start - 1);
                 left_segment->resetBoxes(original_boxes, merge_start);
-                
+
                 for (int i = 0; i < merge_start; i++) {
                     left_segment->logical_box_write_positions[i].store(
                         original_write_positions[i], std::memory_order_relaxed);
                 }
-                
+
                 new_segments.push_back(left_segment);
                 new_segment_start_keys.push_back(left_segment->getLowerBound());
             }
- 
+
             for (size_t i = 0; i < merged_segments.size(); i++) {
                 new_segments.push_back(merged_segments[i]);
                 new_segment_start_keys.push_back(merged_segments[i]->getLowerBound());
@@ -1563,10 +1597,10 @@ public:
 
             if (has_right) {
                 KeyType right_lower = segment->getBoxLower(merge_end + 1);
-                Box<KeyType, ValueType>* right_boxes = original_boxes + 
+                Box<KeyType, ValueType>* right_boxes = original_boxes +
                     ((merge_end + 1) * Segment<KeyType, ValueType>::PHYSICAL_BOXES_PER_LOGICAL);
                 size_t right_logical_box_count = numLogicalBoxes - (merge_end + 1);
-                
+
                 Segment<KeyType, ValueType>* right_segment;
                 if (has_left) {
                     right_segment = new Segment<KeyType, ValueType>(
@@ -1578,12 +1612,12 @@ public:
                     right_segment->lower_bound = right_lower;
                     right_segment->resetBoxes(right_boxes, right_logical_box_count);
                 }
-                
+
                 for (size_t i = 0; i < right_logical_box_count; i++) {
                     right_segment->logical_box_write_positions[i].store(
                         original_write_positions[merge_end + 1 + i], std::memory_order_relaxed);
                 }
-                
+
                 new_segments.push_back(right_segment);
                 new_segment_start_keys.push_back(right_segment->getLowerBound());
             }
@@ -1592,37 +1626,43 @@ public:
             for (auto* seg : merged_segments) {
                 new_segment_start_keys.push_back(seg->getLowerBound());
             }
-        }  
+        }
 
         acquire_critical_section();
-        inPlaceReplaceSegmentWithCompression(segment, new_segments, new_segment_start_keys);        
+        inPlaceReplaceSegmentWithCompression(segment, new_segments, new_segment_start_keys);
         segment->unmark_splitting();
+#ifndef NDEBUG
+        std::cout << "[DEBUG] Thread " << ThreadIdManager::get_thread_id()
+                  << " (sys_tid=" << get_system_thread_id() << ")"
+                  << " set is_splitting_ to FALSE in splitSegment() (end of function) for segment ("
+                  << segment->lower_bound << ", " << segment->upper_bound << ")" << std::endl;
+#endif
         segment->splitting_.store(false, std::memory_order_release);
         release_critical_section();
     }
 
     void insertEmptySlots(int empty_slots_between = 3) {
         if (segments.empty()) return;
-        
+
         std::vector<Segment<KeyType, ValueType>*> new_segments;
         std::vector<KeyType> new_start_keys;
-        
+
         for (size_t i = 0; i < segments.size(); i++) {
             new_segments.push_back(segments[i]);
             new_start_keys.push_back(segment_start_keys[i]);
-            
+
             if (i < segments.size() - 1) {
                 KeyType current_start = segment_start_keys[i];
-                
+
                 for (int j = 1; j <= empty_slots_between; j++) {
                     new_segments.push_back(segments[i]);
                     new_start_keys.push_back(current_start);
                 }
             }
         }
-        
+
         new_start_keys.push_back(segment_start_keys.back());
-        
+
         segments = std::move(new_segments);
         segment_start_keys = std::move(new_start_keys);
     }
@@ -1635,8 +1675,8 @@ public:
 
         size_t memory_bytes = redundantSize * sizeof(int32_t);
         std::cout << "redundantArray size: " << redundantSize << " elements" << std::endl;
-        std::cout << "redundantArray memory: " << memory_bytes << " bytes (" 
-                << (memory_bytes / 1024.0) << " KB, " 
+        std::cout << "redundantArray memory: " << memory_bytes << " bytes ("
+                << (memory_bytes / 1024.0) << " KB, "
                 << (memory_bytes / 1024.0 / 1024.0) << " MB)" << std::endl;
 
         a = static_cast<double>(redundantSize - 1) /
@@ -1670,24 +1710,24 @@ public:
 
         int64_t position = static_cast<int64_t>(a * key + b);
         int32_t estimatedIndex = redundantArray[position];
-            
+
         int32_t left_boundary = estimatedIndex;
-        while (left_boundary > 0 && 
+        while (left_boundary > 0 &&
             segment_start_keys[left_boundary - 1] == segment_start_keys[estimatedIndex]) {
             left_boundary--;
         }
-        
+
         int32_t right_boundary = estimatedIndex;
-        while (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) && 
+        while (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) &&
             segment_start_keys[right_boundary + 1] == segment_start_keys[estimatedIndex]) {
             right_boundary++;
         }
 
         KeyType current_key = segment_start_keys[estimatedIndex];
-        KeyType next_key = (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ? 
-                        segment_start_keys[right_boundary + 1] : 
+        KeyType next_key = (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ?
+                        segment_start_keys[right_boundary + 1] :
                         std::numeric_limits<KeyType>::max();
-        
+
         if (current_key <= key && key < next_key) {
             return estimatedIndex;
         }
@@ -1703,17 +1743,17 @@ public:
         } else { // key >= next_key
             if (right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) {
                 int32_t next_index = right_boundary + 1;
-                
+
                 int32_t next_right_boundary = next_index;
-                while (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) && 
+                while (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1) &&
                     segment_start_keys[next_right_boundary + 1] == segment_start_keys[next_index]) {
                     next_right_boundary++;
                 }
-                
-                KeyType next_next_key = (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ? 
-                                    segment_start_keys[next_right_boundary + 1] : 
+
+                KeyType next_next_key = (next_right_boundary < static_cast<int32_t>(segment_start_keys.size() - 1)) ?
+                                    segment_start_keys[next_right_boundary + 1] :
                                     std::numeric_limits<KeyType>::max();
-                
+
                 if (segment_start_keys[next_index] <= key && key < next_next_key) {
                     return next_index;
                 }
@@ -1767,7 +1807,7 @@ public:
                 }
             }
         }
-        
+
         return -1;
     }
 
