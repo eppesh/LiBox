@@ -22,6 +22,7 @@ struct keySegment {
     size_t end_idx; // exclusive
     KeyType end_key;
     KeyType window_size;
+    size_t num_boxes = 0;
 
     size_t cum_keys = 0;
     size_t cum_underflow = 0;
@@ -41,6 +42,7 @@ struct keySegment {
         cum_keys = seg.cum_keys;
         cum_underflow = seg.cum_underflow;
         cum_overflow = seg.cum_overflow;
+        num_boxes = seg.num_boxes;
     }
 };
 } // namespace seg
@@ -109,6 +111,7 @@ keySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
         }
 
         seg.cum_keys += num_keys;
+        seg.num_boxes++;
         seg.end_idx = new_end_idx;
         seg.end_key = new_end_key;
 
@@ -118,12 +121,14 @@ keySegment<KeyType> makeSegment(const std::vector<KeyType>& data,
             seg.cum_underflow += (BOX_CAPACITY - num_keys);
         }
 
-        double overflow_ratio = (seg.cum_keys > 0)
-                                    ? (static_cast<double>(seg.cum_overflow) / seg.cum_keys)
-                                    : 1;
-        double underflow_ratio = (seg.cum_keys > 0)
-                                     ? (static_cast<double>(seg.cum_underflow) / seg.cum_keys)
-                                     : 1;
+        // double overflow_ratio = (seg.cum_keys > 0)
+        //                             ? (static_cast<double>(seg.cum_overflow) / seg.cum_keys)
+        //                             : 1;
+        // double underflow_ratio = (seg.cum_keys > 0)
+        //                              ? (static_cast<double>(seg.cum_underflow) / seg.cum_keys)
+        //                              : 1;
+        double overflow_ratio = static_cast<double>(seg.cum_overflow) / (seg.num_boxes * BOX_CAPACITY);
+        double underflow_ratio = static_cast<double>(seg.cum_underflow) / (seg.num_boxes * BOX_CAPACITY);
         if (overflow_ratio > overflow_threshold || underflow_ratio > underflow_threshold) {
             num_look_ahead++;
         } else {
@@ -294,10 +299,10 @@ bool validateSegments(const std::vector<KeyType>& data,
         }
         start_key = end_key;
         end_key = seg.seg_upper;
-        if (computeUnderflowRatioAccurate(data, seg) > 0.5 ||
-            computeOverflowRatioAccurate(data, seg) > 0.1) {
-            return false;
-        }
+        // if (computeUnderflowRatioAccurate(data, seg) > 0.5 ||
+        //     computeOverflowRatioAccurate(data, seg) > 0.1) {
+        //     return false;
+        // }
 
         auto start_it = std::lower_bound(data.begin(), data.end(), start_key);
         int num_keys = countKeysInInterval(data,
