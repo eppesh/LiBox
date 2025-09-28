@@ -251,175 +251,6 @@ struct SearchResult {
 static constexpr int32_t BELOW_LOWER_BOUND = -1;
 static constexpr int32_t ABOVE_UPPER_BOUND = -2;
 
-template <typename KeyType, typename ValueType>
-class OverflowKeyValue {
-   private:
-    size_t maxSize = 0;
-    size_t validSize = 0;
-    size_t nearestEmptySlot  = 0;
-    bitset<maxKey> valid_flags;
-
-    alignas(64) array<ValueType, maxKey> values;
-    alignas(64) array<KeyType, maxKey> keys;
-    alignas(64) array<uint8_t, maxKey> keys_low;
-
-    size_t avx512_filter_keys_optimized(KeyType key_low_bound,
-                                        pair<KeyType, ValueType>* result_buffer,
-                                        size_t max_results) const {
-        size_t collected = 0;
-        uint8_t target_low = static_cast<uint8_t>(key_low_bound & 0xFF);
-        __m512i v_threshold = _mm512_set1_epi8(target_low);
-
-        __m512i v_keys = _mm512_load_si512(reinterpret_cast<const __m512i*>(keys_low.data()));
-        __mmask64 mask = _mm512_cmpge_epi8_mask(v_keys, v_threshold);
-
-        while (mask && collected < max_results) {
-            int pos = __builtin_ctzll(mask);
-            result_buffer[collected++] = {keys[pos], values[pos]};
-            mask &= mask - 1;
-        }
-        return collected;
-    }
-
-    size_t copyDataWithLimit(pair<KeyType, ValueType>* result, size_t max_count) const {
-        size_t to_copy = min(maxSize, max_count);
-        for (size_t i = 0; i < to_copy; i++) {
-            result[i] = {keys[i], values[i]};
-        }
-        return to_copy;
-    }
-
-    void updateNearestEmptySlot() {
-        for (size_t i = nearestEmptySlot; i < maxKey; i++) {
-            if (!valid_flags[i]) {
-                nearestEmptySlot = i;
-                return;
-            }
-        }
-        nearestEmptySlot = maxKey;
-    }
-   public:
-    OverflowKeyValue() {}
-
-    size_t getTotalCount() const {
-        return maxSize;
-    }
-
-    bool hasEmptySlots() const {
-        return nearestEmptySlot < maxKey;
-    }
-
-    size_t findKeyIndex(KeyType key) const {
-        uint8_t key_low = key & 0xFF;
-        uint8_t target_low = ((key_low * 251) % 255) + 1;
-
-        __m512i v_target_low = _mm512_set1_epi8(target_low);
-        __m512i v_keys_low = _mm512_load_si512(reinterpret_cast<const __m512i*>(keys_low.data()));
-        __mmask64 mask_low = _mm512_cmpeq_epi8_mask(v_keys_low, v_target_low);
-
-        while (mask_low) {
-            size_t candidate = __builtin_ctzll(mask_low);
-            mask_low &= mask_low - 1;
-            if (keys[candidate] == key && valid_flags[candidate]) return (candidate < maxSize) ? candidate : -1;
-        }
-        return maxKey;
-    }
-
-    void updateValueAt(int index, ValueType value) {
-        values[index] = value;
-    }
-
-    bool deleteKey(KeyType key) {
-        size_t index = findKeyIndex(key);
-        if (index != maxKey) {
-            valid_flags[index] = 0;
-            validSize--;
-            nearestEmptySlot = index < nearestEmptySlot ? index : nearestEmptySlot;
-            return true;
-        }
-        return false;
-    }
-
-    InsertResult insert(KeyType key, ValueType value) {
-        if (nearestEmptySlot >= maxKey) {
-            return {InsertStatus::FULL, -1};
-        }
-        keys[nearestEmptySlot] = key;
-        values[nearestEmptySlot] = value;
-        uint8_t key_low = key & 0xFF;
-        keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
-        valid_flags[nearestEmptySlot] = true;
-        validSize++;
-        if (nearestEmptySlot == maxSize) {
-            maxSize++;
-        }
-        updateNearestEmptySlot();
-        return {InsertStatus::SUCCESS, -1};
-    }
-
-    SearchResult<KeyType, ValueType> search(KeyType key) {
-        size_t index = findKeyIndex(key);
-        if (index != maxKey) {
-            return {SearchStatus::SUCCESS, values[index]};
-        }
-        return {SearchStatus::NOT_FOUND, -1};
-    }
-
-    size_t size() const {
-        return maxSize;
-    }
-
-    vector<pair<KeyType, ValueType>> getEntries() const {
-        vector<pair<KeyType, ValueType>> entries;
-        for (size_t i = 0; i < maxSize; i++) {
-            entries.push_back({keys[i], values[i]});
-        }
-        return entries;
-    }
-
-    void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries) const {
-        size_t start_size = entries->size();
-        entries->resize(start_size + maxSize);
-        for (size_t i = 0; i < maxSize; i++) {
-            (*entries)[start_size + i] = {keys[i], values[i]};
-        }
-    }
-
-    void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries, size_t start_pos) const {
-        for (size_t i = 0; i < maxSize; i++) {
-            (*entries)[start_pos + i] = {keys[i], values[i]};
-        }
-    }
-
-    std::unique_ptr<OverflowKeyValue<KeyType, ValueType>> clone() const {
-        auto newObj = std::make_unique<OverflowKeyValue<KeyType, ValueType>>();
-        newObj->maxSize = maxSize;
-        newObj->validSize = validSize;
-        newObj->nearestEmptySlot = nearestEmptySlot;
-        newObj->valid_flags = valid_flags;
-
-        for (size_t i = 0; i < maxSize; i++) {
-            newObj->keys[i] = keys[i];
-            newObj->keys_low[i] = keys_low[i];
-            newObj->values[i] = values[i];
-        }
-        return newObj;
-    }
-
-    size_t copyAllData(pair<KeyType, ValueType>* result) const {
-        size_t i = 0;
-        for (; i + 8 <= maxSize; i += 8) {
-            for (int j = 0; j < 8; j++) {
-                result[i + j] = {keys[i + j], values[i + j]};
-            }
-        }
-        for (; i < maxSize; i++) {
-            result[i] = {keys[i], values[i]};
-        }
-        return maxSize;
-    }
-};
-
 struct tas_lock {
     std::atomic<bool> lock_ = {false};
 
@@ -468,10 +299,6 @@ class Box {
         INSERT = 1,
         FULL = 2
     };
-
-    // for overflowbox
-    size_t capacity;
-    array<unique_ptr<OverflowKeyValue<KeyType, ValueType>>, overflowCapacity> data;
 
     inline bool test_write_lock(uint32_t &version) const {
         version = version_lock_.load(std::memory_order_acquire);
@@ -557,71 +384,15 @@ class Box {
         return to_copy;
     }
 
-    BoxSearchResult findKeyOrSlot(KeyType key, ValueType value) {
-        size_t existingIndex = findKeyIndex(key);
-        if (existingIndex != maxKey) {
-            values[existingIndex] = value;
-            return {BoxInsertResult::UPDATE, 0, existingIndex};
-        }
-
-        if (validSize < maxKey) {
-            for (size_t i = 0; i < capacity; i++) {
-                size_t existingIndex = data[i]->findKeyIndex(key);
-                if (existingIndex != maxKey) {
-                    data[i]->updateValueAt(existingIndex, value);
-                    return {BoxInsertResult::UPDATE, i+1, existingIndex};
-                }
-            }
-            keys[nearestEmptySlot] = key;
-            values[nearestEmptySlot] = value;
-            uint8_t key_low = key & 0xFF;
-            keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
-            valid_flags[nearestEmptySlot] = true;
-            validSize++;
-            if (nearestEmptySlot == maxSize) {
-                maxSize++;
-            }
-            updateNearestEmptySlot();
-            return {BoxInsertResult::INSERT, 0, nearestEmptySlot};
-        } else {
-            size_t insertBox = capacity;
-            for (int i = capacity-1; i >= 0; i--) {
-                size_t existingIndex = data[i]->findKeyIndex(key);
-                if (existingIndex != maxKey) {
-                    data[i]->updateValueAt(existingIndex, value);
-                    return {BoxInsertResult::UPDATE, static_cast<size_t>(i+1), existingIndex};
-                }
-                if (data[i]->hasEmptySlots()) {
-                    insertBox = i;
-                }
-            }
-            if (insertBox == capacity) {
-                if (capacity == overflowCapacity) {
-                    return {BoxInsertResult::FULL, 0, 0}; // No space left
-                }
-                data[capacity] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
-                data[capacity]->insert(key, value);
-                capacity++;
-                return {BoxInsertResult::INSERT, capacity, 0};
-            } else {
-                data[insertBox]->insert(key, value);
-                return {BoxInsertResult::INSERT, insertBox+1, 0};
-            }
-        }
-    }
-
    public:
-    Box() : capacity(1) {
-        data[0] = make_unique<OverflowKeyValue<KeyType, ValueType>>();
-    }
+    Box() {}
 
     Box(const Box& other)
         : maxSize(other.maxSize),
           validSize(other.validSize),
           keys_low(other.keys_low),
           valid_flags(other.valid_flags),
-          nearestEmptySlot(other.nearestEmptySlot),
-          capacity(other.capacity) {
+          nearestEmptySlot(other.nearestEmptySlot) {
         while (true) {
             uint32_t version_start;
             if (other.test_write_lock(version_start)) {
@@ -633,11 +404,6 @@ class Box {
             values = other.values;
             if (!other.version_changed(version_start)) {
                 break;
-            }
-        }
-        for (size_t i = 0; i < capacity; i++) {
-            if (other.data[i]) {
-                data[i] = other.data[i]->clone();
             }
         }
     }
@@ -657,17 +423,11 @@ class Box {
                 validSize = other.validSize;
                 nearestEmptySlot = other.nearestEmptySlot;
                 valid_flags = other.valid_flags;
-                capacity = other.capacity;
                 keys = other.keys;
                 keys_low = other.keys_low;
                 values = other.values;
                 if (!other.version_changed(version_start)) {
                     break;
-                }
-            }
-            for (size_t i = 0; i < capacity; i++) {
-                if (other.data[i]) {
-                    data[i] = other.data[i]->clone();
                 }
             }
             release_write_lock();
@@ -680,17 +440,12 @@ class Box {
         validSize(other.validSize),
         nearestEmptySlot(other.nearestEmptySlot),
         valid_flags(other.valid_flags),
-        capacity(other.capacity),
         keys(std::move(other.keys)),
         keys_low(std::move(other.keys_low)),
         values(std::move(other.values)) {
 
         version_lock_.store(other.version_lock_.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
-
-        for (size_t i = 0; i < capacity; i++) {
-            data[i] = std::move(other.data[i]);
-        }
     }
 
     Box& operator=(Box&& other) noexcept {
@@ -703,14 +458,9 @@ class Box {
             validSize = other.validSize;
             nearestEmptySlot = other.nearestEmptySlot;
             valid_flags = other.valid_flags;
-            capacity = other.capacity;
             keys = std::move(other.keys);
             keys_low = std::move(other.keys_low);
             values = std::move(other.values);
-
-            for (size_t i = 0; i < capacity; i++) {
-                data[i] = std::move(other.data[i]);
-            }
 
             release_write_lock();
         }
@@ -733,11 +483,7 @@ class Box {
     }
 
     size_t getTotalCount() const {
-        size_t total = maxSize;
-        for (size_t i = 0; i < capacity; i++) {
-            total += data[i]->getTotalCount();
-        }
-        return total;
+        return maxSize;
     }
 
     DeleteResult deleteKey(KeyType key) {
@@ -765,18 +511,35 @@ class Box {
             validSize--;
             nearestEmptySlot = index < nearestEmptySlot ? index : nearestEmptySlot;
             found = true;
-        } else {
-            for (size_t i = 0; i < capacity; i++) {
-                if (data[i] && data[i]->deleteKey(key)) {
-                    found = true;
-                    break;
-                }
-            }
         }
 
         uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
         version_lock_.store(new_version, std::memory_order_release);
         return {found ? DeleteStatus::SUCCESS : DeleteStatus::NOT_FOUND, found};
+    }
+
+    InsertResult updateValue(size_t index, ValueType value) {
+        int retry_count = 0;
+
+    retry_write:
+        uint32_t expected = version_lock_.load(std::memory_order_acquire);
+        if (expected & WRITE_LOCK_BIT) {
+            exponential_backoff(retry_count++);
+            goto retry_write;
+        }
+
+        uint32_t desired = expected | WRITE_LOCK_BIT;
+        if (!version_lock_.compare_exchange_strong(expected, desired,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+            exponential_backoff(retry_count++);
+            goto retry_write;
+        }
+        
+        values[index] = value;
+        uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
+        version_lock_.store(new_version, std::memory_order_release);
+        return {InsertStatus::SUCCESS, -1};
     }
 
     InsertResult insertKeyValue(KeyType key, ValueType value) {
@@ -797,13 +560,48 @@ class Box {
             goto retry_write;
         }
 
-        BoxSearchResult ret = findKeyOrSlot(key, value);
-        InsertStatus status = (ret.isUpdate <= 1) ? InsertStatus::SUCCESS : InsertStatus::FULL;
+        if (nearestEmptySlot >= maxKey) {
+            uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
+            version_lock_.store(new_version, std::memory_order_release);
+            return {InsertStatus::FULL, -1};
+        }
+
+        keys[nearestEmptySlot] = key;
+        values[nearestEmptySlot] = value;
+        uint8_t key_low = key & 0xFF;
+        keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
+        valid_flags[nearestEmptySlot] = true;
+        validSize++;
+        if (nearestEmptySlot == maxSize) {
+            maxSize++;
+        }
+        updateNearestEmptySlot();
 
         uint32_t new_version = ((expected & VERSION_MASK) + 1) & VERSION_MASK;
         version_lock_.store(new_version, std::memory_order_release);
+        return {InsertStatus::SUCCESS, -1};
+    }
 
-        return {status, -1};
+    size_t searchUpdateKey(KeyType key) {
+        int retry_count = 0;
+
+    retry_read:
+        uint32_t start_version = version_lock_.load(std::memory_order_acquire);
+        if (start_version & WRITE_LOCK_BIT) {
+            exponential_backoff(retry_count++);
+            goto retry_read;
+        }
+
+        size_t index = findKeyIndex(key);
+        if (start_version != version_lock_.load(std::memory_order_acquire)) {
+            exponential_backoff(retry_count++);
+            goto retry_read;
+        }
+
+        if (index != maxKey) {
+            return index;
+        }
+        return maxKey;
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
@@ -828,16 +626,6 @@ class Box {
         if (index != maxKey) {
             result_value = values[index];
             status = SearchStatus::SUCCESS;
-        } else {
-            status = SearchStatus::NOT_FOUND;
-            for (size_t i = 0; i < capacity; i++) {
-                SearchResult<KeyType, ValueType> ret = data[i]->search(key);
-                if (ret.status == SearchStatus::SUCCESS) {
-                    result_value = ret.value;
-                    status = SearchStatus::SUCCESS;
-                    break;
-                }
-            }
         }
 #ifdef LOCK_SEARCH
         if (start_version != version_lock_.load(std::memory_order_acquire)) {
@@ -860,10 +648,6 @@ class Box {
         for (size_t i = 0; i < maxSize; i++) {
             entries.push_back({keys[i], values[i]});
         }
-        for (int i = 0; i < capacity; i++) {
-            vector<pair<KeyType, ValueType>> be = data[i]->getEntries();
-            entries.insert(entries.end(), be.begin(), be.end());
-        }
         return entries;
     }
 
@@ -878,13 +662,6 @@ class Box {
         for (size_t i = 0; i < maxSize; i++) {
             (*entries)[start_size + i] = {keys[i], values[i]};
         }
-
-        // Add overflow entries
-        size_t current_pos = start_size + maxSize;
-        for (int i = 0; i < capacity; i++) {
-            data[i]->getEntriesInPlace(entries, current_pos);
-            current_pos += data[i]->size();
-        }
     }
 
     void getEntriesInPlace(vector<pair<KeyType, ValueType>>* entries, size_t start_pos) const {
@@ -893,26 +670,6 @@ class Box {
         for (size_t i = 0; i < maxSize; i++) {
             (*entries)[start_pos + i] = {keys[i], values[i]};
         }
-
-        // Add overflow entries
-        size_t current_pos = start_pos + maxSize;
-        for (int i = 0; i < capacity; i++) {
-            data[i]->getEntriesInPlace(entries, current_pos);
-            current_pos += data[i]->size();
-        }
-    }
-
-    size_t getOverflowBoxCount() const {
-        size_t cap;
-        size_t first_overflow_size;
-        cap = capacity;
-        if (cap == 1) {
-            first_overflow_size = data[0]->size();
-            if (first_overflow_size == 0) {
-                return 0;
-            }
-        }
-        return cap;
     }
 };
 
@@ -922,36 +679,64 @@ ThreadLocalWaitTimingStats split_segment_total_stats(84, "Total splitSegment tim
 template <typename KeyType, typename ValueType>
 class Segment {
 private:
-    KeyType lower_bound;
-    KeyType upper_bound;
     size_t box_key_range;
-    int numBoxes;
     size_t num_threads;
 
+    size_t logical_box_count;
+    size_t physical_box_count;
+
+    Box<KeyType, ValueType>* first_box_ptr;
+    size_t active_box_count;
+
     mutable ThreadLocalCounter operation_counter_;
-    mutable std::atomic<bool> splitting_{false};
     std::atomic_flag splitting_flag_ = ATOMIC_FLAG_INIT;
 public:
-    std::vector<Box<KeyType, ValueType>*> boxes;
+    KeyType lower_bound;
+    KeyType upper_bound;
+    int numBoxes;
+    std::deque<std::atomic<uint8_t>> logical_box_write_positions;
+    static constexpr size_t PHYSICAL_BOXES_PER_LOGICAL = 1 + overflowCapacity;
+    uint8_t insert_position = (1 << PHYSICAL_BOXES_PER_LOGICAL) - 1;
+    mutable std::atomic<bool> splitting_{false};
 
     Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num)
         : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
           operation_counter_(thread_num), num_threads(thread_num) {
+        
         size_t total = upper - lower + 1;
-        size_t box_count = total / box_range;
-        if (total % box_range != 0) box_count++;
-        numBoxes = box_count;
-        boxes.resize(box_count);
-        for (size_t i = 0; i < box_count; i++) {
-            boxes[i] = new Box<KeyType, ValueType>();
+        logical_box_count = total / box_range;
+        if (total % box_range != 0) logical_box_count++;
+        
+        physical_box_count = logical_box_count * PHYSICAL_BOXES_PER_LOGICAL;
+        numBoxes = logical_box_count;
+        active_box_count = logical_box_count;
+        
+        first_box_ptr = new Box<KeyType, ValueType>[physical_box_count];
+        
+        for (size_t i = 0; i < physical_box_count; i++) {
+            new (&first_box_ptr[i]) Box<KeyType, ValueType>();
+        }
+        
+        logical_box_write_positions.resize(logical_box_count);
+        for (size_t i = 0; i < logical_box_count; i++) {
+            logical_box_write_positions[i].store(0, std::memory_order_relaxed);
         }
     }
 
-    ~Segment() {
-        for (auto* box : boxes) {
-            if (box != nullptr) {
-                delete box;
-            }
+    Segment(KeyType lower, KeyType upper, size_t box_range, int thread_num,
+        Box<KeyType, ValueType>* existing_boxes, size_t logical_count, bool take_ownership = false)
+        : lower_bound(lower), upper_bound(upper), box_key_range(box_range),
+        operation_counter_(thread_num), num_threads(thread_num) {
+        
+        logical_box_count = logical_count;
+        physical_box_count = logical_count * PHYSICAL_BOXES_PER_LOGICAL;
+        numBoxes = logical_count;
+        active_box_count = logical_count;
+        first_box_ptr = existing_boxes;
+        
+        logical_box_write_positions.resize(logical_box_count);
+        for (size_t i = 0; i < logical_box_count; i++) {
+            logical_box_write_positions[i].store(0, std::memory_order_relaxed);
         }
     }
 
@@ -962,9 +747,13 @@ public:
         : lower_bound(other.lower_bound),
           upper_bound(other.upper_bound),
           box_key_range(other.box_key_range),
+          logical_box_count(other.logical_box_count),
+          physical_box_count(other.physical_box_count),
           numBoxes(other.numBoxes),
+          active_box_count(other.active_box_count),
           operation_counter_(std::move(other.operation_counter_)),
-          boxes(std::move(other.boxes)) {
+          first_box_ptr(other.first_box_ptr),
+          logical_box_write_positions(std::move(other.logical_box_write_positions)) {
         splitting_.store(other.splitting_.load());
     }
 
@@ -973,12 +762,26 @@ public:
             lower_bound = other.lower_bound;
             upper_bound = other.upper_bound;
             box_key_range = other.box_key_range;
+            logical_box_count = other.logical_box_count;
+            physical_box_count = other.physical_box_count;
             numBoxes = other.numBoxes;
+            active_box_count = other.active_box_count;
             operation_counter_ = std::move(other.operation_counter_);
-            boxes = std::move(other.boxes);
+            first_box_ptr = other.first_box_ptr;
+            logical_box_write_positions = std::move(other.logical_box_write_positions);
             splitting_.store(other.splitting_.load());
         }
         return *this;
+    }
+
+    ~Segment() {}
+
+    size_t getLogicalBoxIndex(KeyType key) const {
+        return (key - lower_bound) / box_key_range;
+    }
+
+    size_t getPhysicalBoxIndex(size_t logical_box_index, uint8_t position_offset) const {
+        return logical_box_index * PHYSICAL_BOXES_PER_LOGICAL + position_offset;
     }
 
     bool enter() {
@@ -1014,12 +817,41 @@ public:
             return {InsertStatus::OUT_OF_RANGE, -1};
         }
 
-        size_t box_index = (key - lower_bound) / box_key_range;
-        InsertResult ret = boxes[box_index]->insertKeyValue(key, value);
-        // ensure overflowing box index propagates up
-        ret.box_index = static_cast<int>(box_index);
+        size_t logical_box_index = getLogicalBoxIndex(key);
+        uint8_t current_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
+        
+        uint8_t temp = insert_position;
+        for (uint8_t pos = 0; pos < current_position+1; pos++) {
+            size_t index = (first_box_ptr + getPhysicalBoxIndex(logical_box_index, pos))->searchUpdateKey(key);
+            if (index != maxKey) {
+                InsertResult result = (first_box_ptr + getPhysicalBoxIndex(logical_box_index, pos))->updateValue(index, value);
+                if (result.status == InsertStatus::SUCCESS) {
+                    leave();
+                    return {InsertStatus::SUCCESS, static_cast<int>(logical_box_index)};
+                }
+                throw std::runtime_error("Unexpected update operation result");
+            }
+            if (!(first_box_ptr + getPhysicalBoxIndex(logical_box_index, pos))->hasEmptySlots()) {
+                temp &= ~(1 << pos);
+            }
+        }
+
+        uint8_t try_insert = 0;
+        while (temp > 0) {
+            InsertResult result = (first_box_ptr + getPhysicalBoxIndex(logical_box_index, try_insert))->insertKeyValue(key, value);
+            if (result.status == InsertStatus::SUCCESS) {
+                if (try_insert > logical_box_write_positions[logical_box_index].load(std::memory_order_acquire)) {
+                    logical_box_write_positions[logical_box_index].store(try_insert, std::memory_order_release);
+                }
+                leave();
+                return {InsertStatus::SUCCESS, static_cast<int>(logical_box_index)};
+            }
+            temp >>= 1;
+            try_insert++;
+        }
+
         leave();
-        return ret;
+        return {InsertStatus::FULL, static_cast<int>(logical_box_index)};
     }
 
     DeleteResult deleteKey(KeyType key) {
@@ -1031,50 +863,77 @@ public:
             return {DeleteStatus::OUT_OF_RANGE, false};
         }
 
-        size_t box_index = (key - lower_bound) / box_key_range;
-        DeleteResult result = boxes[box_index]->deleteKey(key);
+        size_t logical_box_index = getLogicalBoxIndex(key);
+        uint8_t max_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
+        
+        for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
+            size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
+            DeleteResult result = (first_box_ptr + physical_box_index)->deleteKey(key);
+            if (result.found) {
+                leave();
+                return {DeleteStatus::SUCCESS, true};
+            }
+        }
+        
         leave();
-        return result;
+        return {DeleteStatus::NOT_FOUND, false};
     }
 
     SearchResult<KeyType, ValueType> searchKey(KeyType key) {
-        //if (!enter()) {
-        //    return {SearchStatus::SPLIT, -1};
-        //}
-        if (key < lower_bound || key > upper_bound) {
-            //leave();
-            return {SearchStatus::OUT_OF_RANGE, -1};
+        size_t logical_box_index = getLogicalBoxIndex(key);
+        uint8_t max_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
+        
+        for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
+            size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
+            
+            SearchResult<KeyType, ValueType> result = (first_box_ptr + physical_box_index)->searchKey(key);
+            if (result.status == SearchStatus::SUCCESS) {
+                return result;
+            }
         }
-
-        size_t box_index = (key - lower_bound) / box_key_range;
-        SearchResult result = boxes[box_index]->searchKey(key);
-        //leave();
-        return result;
+        
+        return {SearchStatus::NOT_FOUND, -1};
     }
 
     vector<pair<KeyType, ValueType>> prepare_for_split_stage1(int32_t merge_start, int32_t merge_end) {
-        // Pre-calculate total size to avoid reallocations
-        size_t total_size = 0;
         vector<pair<KeyType, ValueType>> mergedEntries;
 
-        // Pre-calculate positions for each selected box
-        int32_t start_box = std::max(0, merge_start);
-        int32_t end_box = std::min(merge_end, static_cast<int32_t>(boxes.size()) - 1);
-        if (start_box > end_box) return mergedEntries;
+        int32_t start_logical_box = std::max(0, merge_start);
+        int32_t end_logical_box = std::min(merge_end, static_cast<int32_t>(logical_box_count) - 1);
+        if (start_logical_box > end_logical_box) return mergedEntries;
 
-        std::vector<size_t> box_start_positions(static_cast<size_t>(end_box - start_box + 2), 0);
-        for (int i = start_box; i <= end_box; i++) {
-            size_t box_size = boxes[i]->getTotalCount();
-            box_start_positions[(i - start_box) + 1] = box_start_positions[(i - start_box)] + box_size;
-            total_size += box_size;
+        std::vector<size_t> box_start_positions(static_cast<size_t>(end_logical_box - start_logical_box + 2), 0);
+        size_t total_size = 0;
+        
+        for (int logical_idx = start_logical_box; logical_idx <= end_logical_box; logical_idx++) {
+            size_t logical_box_size = 0;
+            uint8_t max_position = logical_box_write_positions[logical_idx].load(std::memory_order_acquire);
+            
+            for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
+                size_t physical_box_index = getPhysicalBoxIndex(logical_idx, pos);
+                logical_box_size += (first_box_ptr + physical_box_index)->getTotalCount();
+            }
+            
+            box_start_positions[(logical_idx - start_logical_box) + 1] = 
+                box_start_positions[(logical_idx - start_logical_box)] + logical_box_size;
+            total_size += logical_box_size;
         }
+        
         mergedEntries.resize(total_size);
 
-        for (int i = start_box; i <= end_box; i++) {
-            size_t start_pos = box_start_positions[i - start_box];
-            boxes[i]->getEntriesInPlace(&mergedEntries, start_pos);
+        for (int logical_idx = start_logical_box; logical_idx <= end_logical_box; logical_idx++) {
+            size_t start_pos = box_start_positions[logical_idx - start_logical_box];
+            size_t current_pos = start_pos;
+            uint8_t max_position = logical_box_write_positions[logical_idx].load(std::memory_order_acquire);
+            
+            for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
+                size_t physical_box_index = getPhysicalBoxIndex(logical_idx, pos);
+                (first_box_ptr + physical_box_index)->getEntriesInPlace(&mergedEntries, current_pos);
+                current_pos += (first_box_ptr + physical_box_index)->getTotalCount();
+            }
+            
 #ifdef SORT_BOX
-            size_t end_pos = box_start_positions[(i - start_box) + 1];
+            size_t end_pos = box_start_positions[(logical_idx - start_logical_box) + 1];
             if (end_pos > start_pos) {
                 std::sort(mergedEntries.begin() + start_pos, mergedEntries.begin() + end_pos,
                     [](const pair<KeyType, ValueType>& a, const pair<KeyType, ValueType>& b) {
@@ -1085,27 +944,6 @@ public:
         }
 
         return mergedEntries;
-    }
-
-    vector<pair<KeyType, ValueType>> getBoxRangeEntries(int start_box, int end_box) const {
-        vector<pair<KeyType, ValueType>> entries;
-        int safe_start = std::max(0, start_box);
-        int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
-        for (int i = safe_start; i <= safe_end; i++) {
-            auto box_entries = boxes[i]->getEntries();
-            entries.insert(entries.end(), box_entries.begin(), box_entries.end());
-        }
-        return entries;
-    }
-
-    vector<Box<KeyType, ValueType>> getPreservedBoxes(int start_box, int end_box) const {
-        vector<Box<KeyType, ValueType>> preserved;
-        int safe_start = std::max(0, start_box);
-        int safe_end = std::min(end_box, static_cast<int>(boxes.size()) - 1);
-        for (int i = safe_start; i <= safe_end; i++) {
-            preserved.push_back(boxes[i]);
-        }
-        return preserved;
     }
 
     KeyType getBoxLower(int box_index) const {
@@ -1120,17 +958,37 @@ public:
     KeyType getLowerBound() const { return lower_bound; }
     KeyType getUpperBound() const { return upper_bound; }
     size_t getBoxKeyRange() const { return box_key_range; }
-    size_t getBoxCount() const { return boxes.size(); }
+    size_t getBoxCount() const { return logical_box_count; }
 
     vector<pair<KeyType, ValueType>> getAllEntries() const {
         vector<pair<KeyType, ValueType>> entries;
-        for (const auto* box : boxes) {
-            if (box != nullptr) {
-                vector<pair<KeyType, ValueType>> be = box->getEntries();
-                entries.insert(entries.end(), be.begin(), be.end());
+        for (size_t logical_idx = 0; logical_idx < logical_box_count; logical_idx++) {
+            uint8_t max_position = logical_box_write_positions[logical_idx].load(std::memory_order_acquire);
+            for (uint8_t pos = 0; pos <= max_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
+                size_t physical_box_index = getPhysicalBoxIndex(logical_idx, pos);
+                vector<pair<KeyType, ValueType>> box_entries = (first_box_ptr + physical_box_index)->getEntries();
+                entries.insert(entries.end(), box_entries.begin(), box_entries.end());
             }
         }
         return entries;
+    }
+
+    Box<KeyType, ValueType>* getBoxPtr(size_t index) {
+        size_t physical_index = getPhysicalBoxIndex(index, 0);
+        return first_box_ptr + physical_index;
+    }
+
+    void resetBoxes(Box<KeyType, ValueType>* new_first_box, size_t new_logical_count) {
+        first_box_ptr = new_first_box;
+        logical_box_count = new_logical_count;
+        physical_box_count = new_logical_count * PHYSICAL_BOXES_PER_LOGICAL;
+        active_box_count = new_logical_count;
+        numBoxes = new_logical_count;
+        
+        logical_box_write_positions.resize(logical_box_count);
+        for (size_t i = 0; i < logical_box_count; i++) {
+            logical_box_write_positions[i].store(0, std::memory_order_relaxed);
+        }
     }
 };
 
@@ -1606,7 +1464,6 @@ public:
         if (!global_splitting_.exchange(true)) {
             auto* current = index_structure_.load();
             auto* segment = current->segments[seg_index];
-            cout << "num boxes: " << segment->boxes.size() << endl;
             auto t2 = std::chrono::high_resolution_clock::now();
 
             auto wait_start = std::chrono::high_resolution_clock::now();
@@ -1615,6 +1472,13 @@ public:
             auto wait_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count();
             wait_for_operations_stats_.record_wait(wait_duration);
             auto t3 = std::chrono::high_resolution_clock::now();
+
+            // Save original write positions before split
+            size_t numLogicalBoxes = segment->getBoxCount();
+            std::vector<uint8_t> original_write_positions(numLogicalBoxes);
+            for (size_t i = 0; i < numLogicalBoxes; i++) {
+                original_write_positions[i] = segment->logical_box_write_positions[i].load(std::memory_order_acquire);
+            }
 
             // Calculate the range of boxes to process like small-split-libox.h
             int left_count = NUM_BOXES_TO_LOOK;
@@ -1654,31 +1518,10 @@ public:
             auto t7 = std::chrono::high_resolution_clock::now(); // create phase
 
             std::vector<Segment<KeyType, ValueType>*> new_segments;
-            std::vector<KeyType> new_segment_start_keys;
 
             // Declare timing variables at function scope
             std::chrono::high_resolution_clock::time_point t_left_start, t_left_end;
             std::chrono::high_resolution_clock::time_point t_right_start, t_right_end;
-
-            // Create left segment if there are boxes before the merge range
-            t_left_start = std::chrono::high_resolution_clock::now(); // left_seg phase start
-            if (merge_start > 0) {
-
-                KeyType left_lower = segment->getLowerBound();
-                KeyType left_upper = segment->getBoxUpper(merge_start - 1);
-                auto* left_segment = new Segment<KeyType, ValueType>(
-                    left_lower, left_upper, segment->getBoxKeyRange(), thread_num
-                );
-
-                // Copy box pointers directly from the original segment to the left segment
-                left_segment->boxes.resize(merge_start);
-                std::copy(segment->boxes.begin(), segment->boxes.begin() + merge_start, left_segment->boxes.begin());
-
-                new_segments.push_back(left_segment);
-                new_segment_start_keys.push_back(left_lower);
-
-            }
-            t_left_end = std::chrono::high_resolution_clock::now(); // left_seg phase end
 
             // Process the merged entries to create new segments
             std::vector<Segment<KeyType, ValueType>*> merged_segments;
@@ -1691,54 +1534,76 @@ public:
                     thread_num
                 );
                 merged_segments.push_back(new_seg);
-                new_segments.push_back(new_seg);
-                new_segment_start_keys.push_back(struct_seg.seg_lower);
             }
-            auto t8 = std::chrono::high_resolution_clock::now(); // populate phase
-
-            size_t new_segments_size = new_segments.size();
-
-            // Populate only the merged segments (not left/right segments)
             populateSegmentsSerial(mergedEntries, merged_segments);
+            auto t8 = std::chrono::high_resolution_clock::now();
 
+            Box<KeyType, ValueType>* original_boxes = segment->getBoxPtr(0);
+            KeyType original_upper_bound = segment->getUpperBound();
+
+            Segment<KeyType, ValueType>* left_segment = nullptr;
+            Segment<KeyType, ValueType>* right_segment = nullptr;
+            // Create left segment if there are boxes before the merge range
+            t_left_start = std::chrono::high_resolution_clock::now(); // left_seg phase start
+            if (merge_start > 0) {
+                KeyType left_lower = segment->getBoxLower(0);
+                Box<KeyType, ValueType>* left_boxes = original_boxes;
+                size_t left_logical_box_count = merge_start;
+
+                left_segment = new Segment<KeyType, ValueType>(
+                    left_lower, original_upper_bound, segment->getBoxKeyRange(), thread_num,
+                    left_boxes, left_logical_box_count
+                );
+
+                for (int i = 0; i < merge_start; i++) {
+                    left_segment->logical_box_write_positions[i].store(
+                        original_write_positions[i], std::memory_order_relaxed);
+                }
+            }
+            t_left_end = std::chrono::high_resolution_clock::now(); // left_seg phase end // populate phase
             // Create right segment if there are boxes after the merge range
             if (merge_end < static_cast<int>(numBoxes) - 1) {
                 t_right_start = std::chrono::high_resolution_clock::now(); // right_seg phase start
-
                 KeyType right_lower = segment->getBoxLower(merge_end + 1);
-                KeyType right_upper = segment->getUpperBound();
-                auto* right_segment = new Segment<KeyType, ValueType>(
-                    right_lower, right_upper, segment->getBoxKeyRange(), thread_num
+                Box<KeyType, ValueType>* right_boxes = original_boxes +
+                    ((merge_end + 1) * Segment<KeyType, ValueType>::PHYSICAL_BOXES_PER_LOGICAL);
+                size_t right_logical_box_count = numLogicalBoxes - (merge_end + 1);
+
+                right_segment = new Segment<KeyType, ValueType>(
+                    right_lower, original_upper_bound, segment->getBoxKeyRange(), thread_num,
+                    right_boxes, right_logical_box_count
                 );
 
-                // Copy box pointers directly from the original segment to the right segment
-                int right_box_count = numBoxes - (merge_end + 1);
-                right_segment->boxes.resize(right_box_count);
-                std::copy(segment->boxes.begin() + merge_end + 1, segment->boxes.end(), right_segment->boxes.begin());
-
-                new_segments.push_back(right_segment);
-                new_segment_start_keys.push_back(right_lower);
+                for (size_t i = 0; i < right_logical_box_count; i++) {
+                    right_segment->logical_box_write_positions[i].store(
+                        original_write_positions[merge_end + 1 + i], std::memory_order_relaxed);
+                }
 
                 t_right_end = std::chrono::high_resolution_clock::now(); // right_seg phase end
             }
+
+            if (merge_start > 0) {
+                new_segments.push_back(left_segment);
+            }
+
+            for (size_t i = 0; i < merged_segments.size(); i++) {
+                new_segments.push_back(merged_segments[i]);
+            }
+
+            if (merge_end < static_cast<int>(numBoxes) - 1) {
+                new_segments.push_back(right_segment);
+            }
+
             auto t9 = std::chrono::high_resolution_clock::now();
 
             atomicReplaceIndexStructure(seg_index, new_segments, split_start);
             auto t10 = std::chrono::high_resolution_clock::now();
 
-            // Set pointers to nullptr for boxes that are now owned by left_segment and right_segment
-            // to avoid double-free in the destructor
-            for (int i = 0; i < merge_start; i++) {
-                segment->boxes[i] = nullptr;
-            }
-            for (int i = merge_end + 1; i < static_cast<int>(numBoxes); i++) {
-                segment->boxes[i] = nullptr;
-            }
-            delete segment;
             is_segment_splitting_.store(false, std::memory_order_release);
             is_segment_splitting_.notify_all();
             auto t11 = std::chrono::high_resolution_clock::now();
 
+            auto * now = index_structure_.load();
             unmark_segment_splitting(seg_index);
             global_splitting_.store(false);
             auto t12 = std::chrono::high_resolution_clock::now();
@@ -1787,7 +1652,7 @@ public:
             total_split_operations_.fetch_add(1, std::memory_order_relaxed);
             total_entries_processed_.fetch_add(merged_entries_size, std::memory_order_relaxed);
         total_merged_entries_size_.fetch_add(merged_entries_size, std::memory_order_relaxed);
-            total_segments_created_.fetch_add(new_segments_size, std::memory_order_relaxed);
+            // total_segments_created_.fetch_add(new_segments_size, std::memory_order_relaxed);
         }
 
         auto split_end = std::chrono::high_resolution_clock::now();
