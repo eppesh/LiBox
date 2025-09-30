@@ -14,7 +14,7 @@
 #include <functional>
 #include <atomic>
 
-int max_search_distance = 20000;
+int max_search_distance = 2000;
 int max_actual_search_distance = 0;  // Track the maximum search distance actually used
 
 // Global mutex for thread-safe access to generated_values
@@ -541,7 +541,7 @@ int main() {
     int64_t max_val = 1800 * 1000 * 1000ll;
     int64_t min_val = -max_val;
     double s = 0.75;             // High skewness (typical range: 0.5-2.0)
-    std::string output_file = "worst_case_zipfian-10m.txt";
+    std::string output_file = "worst_case_zipfian-100k.txt";
 
     // Create vector to track generated values
     int64_t range_size = max_val - min_val + 1;
@@ -554,9 +554,9 @@ int main() {
     std::cout << "\n=== Concurrent GenZipfBatch with Thread Pool ===" << std::endl;
 
     // Parameters for concurrent generation
-    size_t batch_count = 10000000;  // Numbers per batch
-    size_t num_threads = 4; // std::thread::hardware_concurrency();  // Use all available CPU cores
-    size_t num_batches = 20;  // One batch per thread
+    size_t batch_count = 100000;  // Numbers per batch
+    size_t num_threads = 6; // std::thread::hardware_concurrency();  // Use all available CPU cores
+    size_t num_batches = 2000;  // One batch per thread
     size_t total_batch_numbers = batch_count * num_batches;
 
     std::cout << "Using " << num_threads << " threads for concurrent generation" << std::endl;
