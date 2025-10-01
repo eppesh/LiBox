@@ -28,6 +28,25 @@ bool load_data(const std::string& input, std::vector<KeyType>& data) {
             std::getline(iss, token, ',');
             data.push_back(std::stoull(token));
         }
+    } else if (input.find(".tsv") != std::string::npos) {
+        // Skip the first line (header)
+        if (getline(fin, line)) {
+            // First line is header, skip it
+        }
+        while (getline(fin, line)) {
+            if (line.empty()) continue;
+            // Read only the first field (before the first tab)
+            std::istringstream iss(line);
+            std::string first_field;
+            std::getline(iss, first_field, '\t');
+            if constexpr (std::is_same_v<KeyType, double>) {
+                data.push_back(std::stod(first_field));
+            } else if constexpr (std::is_signed_v<KeyType>) {
+                data.push_back(std::stoll(first_field));
+            } else {
+                data.push_back(std::stoull(first_field));
+            }
+        }
     } else if (input.find("umass") != std::string::npos ||
                input.find(".csv") != std::string::npos || input.find(".txt") != std::string::npos) {
         while (getline(fin, line)) {
